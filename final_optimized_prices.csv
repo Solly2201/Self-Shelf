@@ -1,0 +1,11 @@
+SKU,Product_Name,Department,Wholesale_Cost,Old_Walmart_Price,New_AI_Optimized_Price,Days_To_Expiry,Urgency_Status,Action_Taken
+285394372,"Stouffer's Beef Stroganoff, 12 Oz",Deli,3.49,4.99,3.08,3,Urgent (Clearance),Markdown Applied (Clearance)
+220261304,"Tropicana Orange Juice, 64 Oz",Beverages,2.79,3.09,2.7,10,Urgent (Clearance),Markdown Applied (Clearance)
+942879597,"Stouffer's Chicken Alfredo, 12 Oz",Deli,3.49,4.99,3.08,2,Urgent (Clearance),Markdown Applied (Clearance)
+228313792,"Chips Ahoy Chocolate Chip Cookies, 13 Oz",Snacks,3.0,4.29,4.29,33,Fresh,Price Maintained
+109639202,"Wonder White Bread, 20 Oz",Bakery,1.74,2.49,2.49,7,Fresh,Price Maintained
+578475588,"Arnold Whole Wheat Bread, 20 Oz",Bakery,2.09,2.36,2.36,4,Fresh,Price Maintained
+758703739,"Breyers Chocolate Ice Cream, 48 Oz",Frozen Foods,4.89,4.95,4.45,29,Urgent (Clearance),Markdown Applied (Clearance)
+365977341,"Wonder White Bread, 20 Oz",Bakery,1.74,2.49,2.49,4,Fresh,Price Maintained
+534795353,"Birds Eye Mixed Vegetables, 16 Oz",Frozen Foods,1.74,2.49,1.85,6,Urgent (Clearance),Markdown Applied (Clearance)
+115707559,"Betty Crocker Chocolate Cake, 15 Oz",Bakery,4.19,5.99,3.66,3,Urgent (Clearance),Markdown Applied (Clearance)
