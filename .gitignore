@@ -1,12 +1,18 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+.venv/
+venv/
 
-# Academic / submission material
-*.pdf
-*.docx
-*.zip
-
-# Private project material
+# Local academic/project material
 Code/
-Reference Papers/
+Reports/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
