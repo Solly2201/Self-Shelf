@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Academic / submission material
+*.pdf
+*.docx
+*.zip
+
+# Private project material
+Code/
+Reference Papers/
