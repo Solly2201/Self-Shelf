@@ -162,6 +162,74 @@ expected economic outcome improves by $13.31 over the evaluation window
 
 ---
 
+## V1.1 — Adaptive Retail Optimization
+
+V1.1 turns the open-loop optimizer into an adaptive system built from three pieces that share one loop:
+
+```text
+current state (inventory, actual sales, deliveries, days to expiry)
+      → demand belief + elasticity (with confidence)
+      → frozen economic engine
+      → multi-period optimizer (replenishment-aware)
+      → act today's price
+      → observe actual sales
+      → update state and beliefs
+      → RE-OPTIMIZE, daily, until expiry
+```
+
+The frozen economic engine is untouched: every new layer *delegates* its valuation to the audited primitives, and parity tests prove that with the new features switched off (no deliveries, no feedback) each layer reproduces the frozen engine's numbers exactly.
+
+### Closed-loop re-optimization (open-loop vs closed-loop)
+
+The V1.0 path optimizer is **open-loop**: it plans day 0…N and assumes reality complies. If it expects to sell 20 units on day 0 and only 8 sell, the day-1 plan is already wrong — inventory is 12 units higher than the plan believed.
+
+The V1.1 controller (`closedloop.py`) is **closed-loop**. `RetailState` tracks realized state (inventory by lot, price in effect, shelf life, cumulative sales/waste, deliveries received, last forecast vs last observation), and every day the controller:
+
+1. re-optimizes the remaining path from the *actual* state,
+2. acts today's planned price,
+3. observes actual (not forecast) sales,
+4. applies sales FIFO (expiring stock first), books tonight's expiry waste, receives tomorrow's delivery,
+5. smooths its demand-level belief toward the observation — only on days *not* censored by a stockout (selling every unit proves demand ≥ sales, so such days must not drag the forecast down), and never touching elasticity (one day at one price carries no information about the price response),
+6. repeats until expiry.
+
+Planned vs realized is explicit: every day records the planned path, the forecast, the observation, and the surprise. Determinism: the same product, config, environment, and delivery schedule reproduce the identical episode.
+
+A three-strategy backtest (hold / execute the day-0 plan blind / re-optimize daily) replays all strategies under the synthetic simulator with **common random numbers**; on the default 50-product demo run the closed loop recovers more economic value than the open-loop plan, which beats holding. Synthetic simulation only — it measures *adaptive behavior*, not real-world performance.
+
+### Elasticity uncertainty
+
+The engine has always priced with a point elasticity (say −1.67). V1.1 answers *how much that number should be trusted* (`uncertainty.py`): the identical log-log regression is run with standard OLS inference on top —
+
+```text
+elasticity   −1.67
+SE            0.18
+95% CI       [−2.02, −1.32]
+270 observations across 5 distinct price levels
+```
+
+Point estimates are bit-identical to the frozen estimator by construction (and by test), so the confidence layer can never disagree with the engine about *what* the elasticity is — only report how well-identified it is. Confidence labels are coarse and rule-based (High / Medium / Low, documented thresholds on the relative CI half-width, observation count, and distinct price levels). **Fallback elasticities get no interval**: a configured constant has no sampling distribution, and the UI says "Fallback estimate" instead of inventing one.
+
+Confidence is deliberately **information, not a pricing penalty** — the recommendation still comes from the frozen economics. No hidden uncertainty adjustment contaminates the baseline.
+
+### Replenishment
+
+Inventory can now rise: `replenishment.py` models **known future deliveries** (date, product id, quantity) as time-respecting events. Stock is held in two lots — the expiring on-shelf lot and fresh arrivals — rotated FIFO, so:
+
+- a delivery on day *d* becomes sellable at the start of day *d* and *never earlier* (a "day 0" delivery is a hard error: already-arrived stock belongs in inventory, and letting it into the planner would double-count it);
+- only the expiring lot can become waste, priced by the frozen waste economics; expired stock is never resurrected as fresh stock;
+- the accounting identity `initial inventory + arrivals = sales + terminal inventory` holds throughout.
+
+The multi-period optimizer enumerates the identical candidate class with the identical tie-breaking — only the valuation sees the arrivals — and with an empty schedule it returns exactly the frozen optimizer's result (tested). When no replenishment file is supplied the dashboard states **"No replenishment data supplied; inventory is modeled as non-replenished"** rather than silently assuming anything; in demo mode it says the simulator does not model deliveries at all.
+
+### What V1.1 explicitly does not claim
+
+- The closed loop runs against *simulated* observations (a labeled what-if demand environment, or the synthetic simulator in backtests) — this is a closed-loop **simulator/controller**, not a production event-streaming deployment.
+- Confidence intervals are finite-sample statistical estimates under the regression's assumptions, not guarantees.
+- Replenishment awareness is only as good as the supplied schedule; delivery shelf life defaults to "fresh" (no expiry inside the planning window) when the data does not say otherwise.
+- Strategic customers and competitor behavior remain out of scope, as before.
+
+---
+
 ## Two Data Modes
 
 Self-Shelf runs in one of two explicitly separated modes; the dashboard always shows which one is active, and the two are never mixed.
@@ -198,13 +266,21 @@ Import your own data on the dashboard's **Data** page (or via the API). Two CSV 
 | `units_sold` | ✔ | units sold that day |
 | `promotion` | | 0/1 flag, used as a regression control |
 
+**Replenishment** — optional, one row per future delivery (without it, inventory is modeled as non-replenished and the dashboard says so):
+
+| Field | Required | Notes |
+|---|---|---|
+| `date` | ✔ | delivery date; dates on/before the data's "today" (the day after the last recorded sale) are treated as already in inventory and excluded |
+| `product_id` | ✔ | must match the products file |
+| `quantity` | ✔ | units received (non-negative) |
+
 The import flow: **upload → map columns → validate → preview → import**. Column names don't need to match — the importer suggests a mapping from common synonyms (`sku` → `product_id`, `qty_sold` → `units_sold`, …) and every suggestion can be corrected manually. Validation rejects malformed rows (missing ids, negative prices/costs/inventory, unparseable dates, duplicate product ids, transactions for unknown products) with **human-readable per-issue counts, and the rejected rows are downloadable** — nothing is silently dropped. A quality summary reports how much information the data actually contains: products with/without history, transaction counts, date range.
 
-**Elasticity is estimated from your history**, per category, with the same log-log regression the synthetic pipeline uses (`log Q ~ α + e·log(P/P_list) + promo`). All history precedes "now", so nothing leaks from the future into the estimate; a stability check re-runs the estimator on only the earliest 80% of observations and flags estimates that move materially. Categories with too few observations, no price variation, or an implausible estimate fall back to the configured default elasticity **and are labelled as fallbacks everywhere they appear** — the dashboard never pretends an assumption was learned from your data. Baseline daily demand per product is its recent observed sales rate translated to the current price via the elasticity; products with no history fall back to category/global medians, again labelled.
+**Elasticity is estimated from your history**, per category, with the same log-log regression the synthetic pipeline uses (`log Q ~ α + e·log(P/P_list) + promo`), now with a standard error and 95% confidence interval alongside every estimated value (see the V1.1 section). All history precedes "now", so nothing leaks from the future into the estimate; a stability check re-runs the estimator on only the earliest 80% of observations and flags estimates that move materially. Categories with too few observations, no price variation, or an implausible estimate fall back to the configured default elasticity **and are labelled as fallbacks everywhere they appear** — the dashboard never pretends an assumption was learned from your data. Baseline daily demand per product is its recent observed sales rate translated to the current price via the elasticity; products with no history fall back to category/global medians, again labelled.
 
 Imported datasets persist under `data/custom/` (gitignored — private retail data can never be committed) and survive restarts, including which source was active. There is **no synthetic backtest in custom mode**: no ground-truth simulator exists for real data, and the dashboard says so instead of fabricating one.
 
-Sample files to try the flow: `data/sample_custom_products.csv` and `data/sample_custom_transactions.csv` (12 products, 90 days of history, two products deliberately without history to demonstrate the labelled fallbacks).
+Sample files to try the flow: `data/sample_custom_products.csv`, `data/sample_custom_transactions.csv`, and `data/sample_custom_replenishment.csv` (12 products, 90 days of history, two products deliberately without history to demonstrate the labelled fallbacks, and a small delivery schedule — including one past delivery that the importer correctly treats as already on the shelf).
 
 ---
 
@@ -247,7 +323,16 @@ Self-Shelf/
 │       │                        the frozen path evaluator)
 │       ├── pathbacktest.py      hold vs immediate vs path replay
 │       ├── customdata.py        custom CSV import: mapping, validation,
-│       │                        persistence, historical demand params
+│       │                        persistence, historical demand params,
+│       │                        replenishment ingestion
+│       ├── uncertainty.py       elasticity standard errors / confidence
+│       │                        intervals (same regression, OLS inference)
+│       ├── replenishment.py     known future deliveries: schedules,
+│       │                        lot-based replay, aware path optimizer
+│       ├── closedloop.py        RetailState + daily observe/re-optimize
+│       │                        controller and demand environments
+│       ├── adaptivebacktest.py  hold vs open-loop vs closed-loop and
+│       │                        naive-vs-aware replenishment backtests
 │       ├── webdata.py           dashboard service layer over the engine
 │       │                        (synthetic + custom sources)
 │       └── webapp.py            FastAPI app serving data + dashboard
@@ -334,10 +419,10 @@ A pricing-intelligence interface on top of the engine. The optimization runs onc
 
 - **Overview** — portfolio KPIs, the markdown queue ranked by expected economic improvement, inventory risk bands, the hold-vs-recommended synthetic backtest (demo mode), and an economic-value curve explaining the top recommendation.
 - **Products** — searchable, sortable table of every recommendation with filters (markdown / hold / at risk / near expiry / high inventory pressure) and CSV export.
-- **Product detail** — the full story for one decision: economic value and demand curves across the allowed price range, keep-vs-recommended breakdown, break-even economics, structured reasons, the **recommended multi-day price path** (vs hold and immediate markdown), demand-parameter provenance in custom mode, and a scenario slider that evaluates any allowed price live in the backend engine.
+- **Product detail** — the full story for one decision: economic value and demand curves across the allowed price range, keep-vs-recommended breakdown, break-even economics, structured reasons, the **recommended multi-day price path** (vs hold and immediate markdown, with incoming deliveries marked on the timeline), an **elasticity confidence** card (estimate, 95% CI, SE, observation counts, High/Medium/Low/Fallback), a **replenishment** card (next delivery and quantities, or an explicit no-data statement), a **closed-loop simulation** card (planned vs acted prices, forecast vs observed sales per day, and the measured value of daily feedback under a labeled synthetic what-if), demand-parameter provenance in custom mode, and a scenario slider that evaluates any allowed price live in the backend engine.
 - **Pricing** — a scenario lab with two modes: **single price** (slider across the allowed range) and **price path** (edit a price per day; the whole path is validated and valued by the backend, and compared against hold and the optimized schedule).
-- **Analytics** — markdown depth distribution, risk bands, days-of-supply distribution, expected waste by department, current→recommended price changes, and the **three-strategy multi-period backtest** (demo mode).
-- **Data** — the custom-data workflow: upload, column mapping, validation with downloadable rejected rows, quality summary, per-category elasticity provenance, source switching, and CSV exports (recommendations + per-day price paths).
+- **Analytics** — markdown depth distribution, risk bands, days-of-supply distribution, expected waste by department, current→recommended price changes, the **three-strategy multi-period backtest**, and the **closed-loop strategy backtest** (hold vs open-loop vs daily re-optimization; demo mode).
+- **Data** — the custom-data workflow: upload (including the optional replenishment file), column mapping, validation with downloadable rejected rows, quality summary, per-category elasticity provenance with confidence intervals, source switching, and CSV exports (recommendations with confidence/replenishment columns, per-day price paths with delivery events, and a per-category elasticity/confidence file).
 
 Architecture: the frozen pricing engine → an in-process service layer (`webdata.py`, one presentation layer over two data sources) → a thin FastAPI adapter (`webapp.py`) → a dependency-free static frontend (`web/`). A parity test asserts the synthetic service serves recommendations identical to the CLI pipeline's output. The frontend contains **no economic formulas** in either mode.
 
@@ -351,7 +436,7 @@ The UI is explicitly labeled **Simulation mode** or **Custom data** at all times
 python -m pytest
 ```
 
-The suite (≈300 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
+The suite (400+ tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
 
 - healthy inventory is not marked down
 - overstocked near-expiry stock receives meaningful downward pressure that measurably reduces expected waste
@@ -374,6 +459,8 @@ The multi-period suite locks down: agreement with an independent brute-force enu
 
 The custom-data suite covers mapping suggestions, row-level validation and reject reasons, currency parsing, duplicate/unknown-id handling, persistence round trips, elasticity recovery from generated history (and every fallback reason: too few observations, no price variation, no history), the zero-sale-day convention, provenance labelling, mode isolation, restart persistence, and the full upload → map → validate → import API flow.
 
+The V1.1 adaptive suite adds: point-estimate parity between the confidence layer and the frozen estimator, CI coverage of a known synthetic elasticity across seeds, precision improving with more observations and more price variation, no fake intervals on fallbacks, degenerate-regression safety; exact parity of the replenishment replay/optimizer with the frozen evaluator/optimizer under an empty schedule, time-respecting arrivals (future stock is never sold early), FIFO expiry (fresh deliveries never become waste), the extended accounting identity; closed-loop state transitions driven by observed (not forecast) sales, censored-day belief handling, determinism, a leakage test proving future demand cannot change today's price, bit-parity of a fixed hold path with the frozen backtest replay, the hold/open-loop/closed-loop and naive/aware-replenishment backtests under common random numbers; an end-to-end API integration test (custom data + replenishment file + confidence + closed loop); and an adversarial matrix crossing elasticity × inventory × expiry × replenishment × observed-sales scenarios, asserting constraint/accounting invariants and economically sensible directionality in every cell (never hard-coded answers).
+
 ---
 
 ## Assumptions That Need Real Business Data
@@ -394,14 +481,16 @@ Before production use, these configured assumptions must be replaced with real d
 
 Beyond data, several modeling limitations are known and deliberate:
 
-- **Open-loop paths.** The multi-period optimizer commits to a schedule under today's demand forecast; it does not yet re-decide daily as actual sales are observed (closed-loop/dynamic-programming re-optimization is future work). The candidate class is also restricted to at most two downward moves — operationally realistic, but not the unrestricted optimum.
-- **Myopic customers.** Demand depends only on today's price. The markdown literature shows strategic customers who anticipate future discounts can change optimal markdown policies; nothing here models that, and no claim is made either way.
-- **No replenishment or competition.** The engine prices a fixed stock through its remaining life; reordering, competitor prices, and cross-product cannibalization are out of scope.
-- **Custom-data caveats.** Estimates are only as good as the history: elasticities need genuine price variation (fallbacks are labelled when it is absent), transaction files are assumed to be daily aggregates where missing days mean zero sales, and uncertainty in the estimates is reported only coarsely (observation counts, price variation, a stability check) rather than as full confidence intervals.
+- **Closed-loop simulation, not production streaming.** The V1.1 controller re-optimizes daily against *simulated* observations (labeled what-if environments, or the synthetic simulator in backtests). Wiring it to a live point-of-sale feed is an integration exercise, not something this repository claims to have done.
+- **Candidate class.** Paths are restricted to at most two downward moves at daily granularity — operationally realistic, exhaustively searched, but not the unrestricted optimum.
+- **Confidence intervals are estimates.** They are finite-sample OLS intervals under the regression's assumptions (log-linear demand, independent errors); they are honest statistics, not guarantees, and the demand-level belief update is deliberately simple exponential smoothing on uncensored days only.
+- **Replenishment depends on data quality.** Only deliveries present in the supplied schedule are known to the planner; delivery shelf life defaults to "fresh within the planning window" when the data does not say otherwise. When no data is supplied, the system says so and models no replenishment.
+- **Myopic customers.** Demand depends only on today's price. Strategic customers who anticipate future discounts can change optimal markdown policies; nothing here models that, and no claim is made either way.
+- **No competition.** Competitor prices and cross-product cannibalization remain out of scope.
 
 ### Future work
 
-Closed-loop multi-period re-optimization, uncertainty quantification on elasticity estimates, replenishment-aware pricing, competitor-price ingestion, authentication/multi-user deployment, and a database-backed store for large datasets.
+Online elasticity re-estimation across episodes (with the uncertainty machinery guarding against overreacting to noise), an explicit uncertainty-aware conservative pricing mode (evaluating recommendations across the CI rather than at the point estimate), lot-level expiry tracking for deliveries with known shelf lives, competitor-price ingestion, authentication/multi-user deployment, and a database-backed store for large datasets.
 
 ---
 
