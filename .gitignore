@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 .venv/
@@ -8,6 +9,9 @@ venv/
 # Local academic/project material
 Code/
 Reports/
+
+# Generated analysis artifacts (the sample recommendations CSV is tracked)
+output/*_sweep.csv
 
 # IDE
 .vscode/
