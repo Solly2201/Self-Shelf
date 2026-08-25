@@ -2,7 +2,7 @@
 
 ### Expiry-Aware Dynamic Pricing for Retail Inventory
 
-Self-Shelf is a dynamic-pricing engine for perishable retail inventory. It combines a machine-learning demand forecast with an **explicit economic layer** — price elasticity, expiry pressure, inventory pressure, and expected waste — and uses **Particle Swarm Optimization (PSO)** to pick the price with the best expected economic outcome.
+Self-Shelf is a dynamic-pricing system for perishable retail inventory. It combines a machine-learning demand forecast with an **explicit economic layer** — price elasticity, expiry pressure, inventory pressure, and expected waste — and determines not only **whether** a product should be marked down, but **when, by how much, and why**: a one-shot optimal price today, and a **multi-period price path** over the remaining shelf life. It runs on either a synthetic demonstration simulation or **your own inventory and transaction history**, imported through the dashboard.
 
 The design principle:
 
@@ -13,18 +13,25 @@ The design principle:
 ## Architecture
 
 ```text
-Demand Model (Random Forest)
-        │  baseline daily demand at the current price
+Data (synthetic simulator  OR  imported products + sales history)
+        │
         ▼
-Economic Layer
-        │  elasticity · expiry pressure · inventory pressure
-        │  expected waste · constraints
+Demand layer
+        │  baseline daily demand · price elasticity
+        │  (estimated from observed sales, with labelled fallbacks)
         ▼
-PSO
-        │  searches the constrained price range
+Economic layer
+        │  expiry pressure · inventory pressure · expected waste
+        │  salvage · holding cost · break-even · constraints
         ▼
-Recommendation
-           price · action · structured economic explanation
+Optimization
+        │  PSO over the price range (today's price)
+        │  exhaustive staged-schedule search (multi-period path)
+        ▼
+Explainable recommendations
+        │  price · path · action · structured economic explanation
+        ▼
+Dashboard + API + CSV export
 ```
 
 ### Why not let the ML model discover the economics?
@@ -109,9 +116,34 @@ Nothing marks a product down merely because expiry is near: a near-expiry produc
 Two classic sanity metrics are computed for every markdown:
 
 - **Break-even unit uplift** — `(P₀ − C) / (P₁ − C)`, the volume multiplier needed to hold gross profit. A 20% markdown on a 40%-margin product needs ~2× the volume. Recommendations report this hurdle next to the predicted uplift, so it is explicit when a markdown is justified by waste/terminal-stock avoidance rather than by demand stimulation alone.
-- **Timing advantage** — a simplified two-path comparison (markdown now for the whole window vs hold for a few days, then apply the same markdown) quantifying the value preserved by acting early. This is a fixed-path evaluation, not a full multi-period optimization; staged markdown scheduling remains future work.
+- **Timing advantage** — a simplified two-path comparison (markdown now for the whole window vs hold for a few days, then apply the same markdown) quantifying the value preserved by acting early. The full multi-period optimizer (below) generalizes this to arbitrary staged schedules.
 
 Markdown **depth** is discovered by the optimizer from elasticity, inventory pressure, remaining time, margin and waste economics — there are no "urgent = 30% off" rules, and the deepest allowed discount is chosen only when it actually scores best.
+
+### Multi-period markdown optimization
+
+The engine also answers *"what pricing path should this product follow over its remaining shelf life?"*:
+
+```text
+Day 0   $4.99      hold
+Day 1   $4.99      hold
+Day 2   $4.49      first markdown
+Day 3   $4.49
+Day 4   $3.99      clearance step
+```
+
+The path optimizer (`pathopt.py`) is an adapter over the audited path evaluator `economics.evaluate_price_path` — the same accounting as the one-shot objective (a one-segment path reproduces `score(P)` exactly). It **exhaustively enumerates** an operationally realistic policy class: piecewise-constant schedules with at most two downward price moves at daily granularity (retailers do not re-sticker shelves hourly), subject to
+
+- the expiry-blended price floor (identical to the one-shot bounds, cross-checked by test)
+- no price increases, monotonically non-increasing paths
+- a maximum per-day price move
+- the minimum-meaningful-markdown convention
+
+Because the **hold-forever schedule is always a candidate** and ties break toward holding and later/shallower markdowns, a markdown path is only ever recommended when it strictly beats holding — the optimizer explicitly understands that *a markdown today is not free when repricing tomorrow is possible*, which is what prevents unnecessarily early markdowns. This is deliberately **not** "run the daily optimizer repeatedly" (a greedy approach that ignores the value of waiting).
+
+The method is deterministic (no randomness anywhere), exactly optimal within its candidate class, and validated against an independent brute-force enumeration over all feasible daily price sequences in the tests. Each product's result reports the recommended schedule, a day-by-day expected trajectory (demand, sales, inventory, revenue — proven to decompose the evaluator's totals exactly), and comparisons against two baselines: **hold throughout** and **immediate one-shot markdown**.
+
+A three-strategy counterfactual backtest (hold vs immediate markdown vs optimized path) replays all three under the synthetic simulator with identical demand noise — synthetic simulation only, and only available in demo mode, because imported data has no ground-truth simulator to replay against.
 
 ### Explanations
 
@@ -130,9 +162,55 @@ expected economic outcome improves by $13.31 over the evaluation window
 
 ---
 
-## Important Limitation: Synthetic Demand
+## Two Data Modes
 
-**The dataset contains no historical sales volume, cost, expiry dates, or inventory levels.** Those are simulated:
+Self-Shelf runs in one of two explicitly separated modes; the dashboard always shows which one is active, and the two are never mixed.
+
+### Demo mode (synthetic simulation)
+
+The default. Demand, costs, expiry dates, and inventory come from the documented synthetic simulator below. The badge reads **Simulation mode** and no figure is presented as real-world performance.
+
+### Custom data mode
+
+Import your own data on the dashboard's **Data** page (or via the API). Two CSV files:
+
+**Products** — one row per product, the current state of the shelf:
+
+| Field | Required | Notes |
+|---|---|---|
+| `product_id` | ✔ | any unique identifier (SKU, UPC, …) |
+| `product_name` | ✔ | |
+| `current_price` | ✔ | today's shelf price |
+| `cost` | ✔ | unit procurement cost |
+| `inventory` | ✔ | units on hand |
+| `days_to_expiry` | ✔ | remaining shelf life in days |
+| `category` | | used to pool elasticity estimation (default "General") |
+| `retail_price` | | list price; defaults to `current_price` |
+| `promotion` | | 0/1 flag |
+
+**Transactions** — one row per product per day of sales history (**required** — demand is estimated from observed sales, and Self-Shelf refuses to invent it):
+
+| Field | Required | Notes |
+|---|---|---|
+| `date` | ✔ | daily granularity; missing days count as zero-sale days |
+| `product_id` | ✔ | must match the products file |
+| `price` | ✔ | price charged that day |
+| `units_sold` | ✔ | units sold that day |
+| `promotion` | | 0/1 flag, used as a regression control |
+
+The import flow: **upload → map columns → validate → preview → import**. Column names don't need to match — the importer suggests a mapping from common synonyms (`sku` → `product_id`, `qty_sold` → `units_sold`, …) and every suggestion can be corrected manually. Validation rejects malformed rows (missing ids, negative prices/costs/inventory, unparseable dates, duplicate product ids, transactions for unknown products) with **human-readable per-issue counts, and the rejected rows are downloadable** — nothing is silently dropped. A quality summary reports how much information the data actually contains: products with/without history, transaction counts, date range.
+
+**Elasticity is estimated from your history**, per category, with the same log-log regression the synthetic pipeline uses (`log Q ~ α + e·log(P/P_list) + promo`). All history precedes "now", so nothing leaks from the future into the estimate; a stability check re-runs the estimator on only the earliest 80% of observations and flags estimates that move materially. Categories with too few observations, no price variation, or an implausible estimate fall back to the configured default elasticity **and are labelled as fallbacks everywhere they appear** — the dashboard never pretends an assumption was learned from your data. Baseline daily demand per product is its recent observed sales rate translated to the current price via the elasticity; products with no history fall back to category/global medians, again labelled.
+
+Imported datasets persist under `data/custom/` (gitignored — private retail data can never be committed) and survive restarts, including which source was active. There is **no synthetic backtest in custom mode**: no ground-truth simulator exists for real data, and the dashboard says so instead of fabricating one.
+
+Sample files to try the flow: `data/sample_custom_products.csv` and `data/sample_custom_transactions.csv` (12 products, 90 days of history, two products deliberately without history to demonstrate the labelled fallbacks).
+
+---
+
+## Important Limitation: Synthetic Demand (demo mode)
+
+**The demo dataset contains no historical sales volume, cost, expiry dates, or inventory levels.** Those are simulated:
 
 - **Demand** comes from an explicit multiplicative simulator:
   `base × price effect (constant elasticity) × promotion × freshness × seasonality × noise`
@@ -165,12 +243,19 @@ Self-Shelf/
 │       ├── optimizer.py         per-product optimization + explanations
 │       ├── backtest.py          hold-vs-recommended counterfactual replay
 │       ├── pipeline.py          end-to-end orchestration
+│       ├── pathopt.py           multi-period path optimizer (adapter over
+│       │                        the frozen path evaluator)
+│       ├── pathbacktest.py      hold vs immediate vs path replay
+│       ├── customdata.py        custom CSV import: mapping, validation,
+│       │                        persistence, historical demand params
 │       ├── webdata.py           dashboard service layer over the engine
+│       │                        (synthetic + custom sources)
 │       └── webapp.py            FastAPI app serving data + dashboard
 ├── web/                         dashboard frontend (no build step)
 ├── tests/                       unit + behavioral test suite
-├── data/                        retail dataset (prices, departments,
-│                                promotions)
+├── data/                        demo dataset + sample custom CSVs
+│   └── custom/                  imported user data (gitignored)
+├── Dockerfile, compose.yaml     containerized run
 └── output/                      generated recommendations
 ```
 
@@ -237,17 +322,26 @@ python src/serve.py                # http://127.0.0.1:8765
 python src/serve.py -n 100         # optimize 100 products instead of 50
 ```
 
+Or with Docker:
+
+```bash
+docker compose up --build          # same app on http://127.0.0.1:8765
+```
+
+The compose file mounts `data/custom/` so imported datasets survive container restarts.
+
 A pricing-intelligence interface on top of the engine. The optimization runs once at startup (the UI shows progress until it finishes); every number displayed is computed by the engine — the frontend contains no economic formulas.
 
-- **Overview** — portfolio KPIs, the markdown queue ranked by expected economic improvement, inventory risk bands, the hold-vs-recommended synthetic backtest, and an economic-value curve explaining the top recommendation.
-- **Products** — searchable, sortable table of every recommendation with filters (markdown / hold / at risk / near expiry / high inventory pressure).
-- **Product detail** — the full story for one decision: economic value and demand curves across the allowed price range, keep-vs-recommended breakdown, break-even economics, structured reasons, markdown-now-vs-wait comparison, and a scenario slider that evaluates any allowed price live in the backend engine.
-- **Pricing** — a scenario lab for exploring candidate prices product by product.
-- **Analytics** — markdown depth distribution, risk bands, days-of-supply distribution, expected waste by department, and current→recommended price changes.
+- **Overview** — portfolio KPIs, the markdown queue ranked by expected economic improvement, inventory risk bands, the hold-vs-recommended synthetic backtest (demo mode), and an economic-value curve explaining the top recommendation.
+- **Products** — searchable, sortable table of every recommendation with filters (markdown / hold / at risk / near expiry / high inventory pressure) and CSV export.
+- **Product detail** — the full story for one decision: economic value and demand curves across the allowed price range, keep-vs-recommended breakdown, break-even economics, structured reasons, the **recommended multi-day price path** (vs hold and immediate markdown), demand-parameter provenance in custom mode, and a scenario slider that evaluates any allowed price live in the backend engine.
+- **Pricing** — a scenario lab with two modes: **single price** (slider across the allowed range) and **price path** (edit a price per day; the whole path is validated and valued by the backend, and compared against hold and the optimized schedule).
+- **Analytics** — markdown depth distribution, risk bands, days-of-supply distribution, expected waste by department, current→recommended price changes, and the **three-strategy multi-period backtest** (demo mode).
+- **Data** — the custom-data workflow: upload, column mapping, validation with downloadable rejected rows, quality summary, per-category elasticity provenance, source switching, and CSV exports (recommendations + per-day price paths).
 
-Architecture: the frozen pricing engine → an in-process service layer (`webdata.py`) that runs the exact pipeline and keeps the rich per-product objects → a thin FastAPI adapter (`webapp.py`) → a dependency-free static frontend (`web/`). A parity test asserts the service serves recommendations identical to the CLI pipeline's output.
+Architecture: the frozen pricing engine → an in-process service layer (`webdata.py`, one presentation layer over two data sources) → a thin FastAPI adapter (`webapp.py`) → a dependency-free static frontend (`web/`). A parity test asserts the synthetic service serves recommendations identical to the CLI pipeline's output. The frontend contains **no economic formulas** in either mode.
 
-The UI is explicitly labeled **Simulation mode** throughout: all figures are synthetic-simulation results, not real retail performance.
+The UI is explicitly labeled **Simulation mode** or **Custom data** at all times.
 
 ---
 
@@ -257,7 +351,7 @@ The UI is explicitly labeled **Simulation mode** throughout: all figures are syn
 python -m pytest
 ```
 
-The suite (≈175 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
+The suite (≈300 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
 
 - healthy inventory is not marked down
 - overstocked near-expiry stock receives meaningful downward pressure that measurably reduces expected waste
@@ -275,6 +369,10 @@ The suite (≈175 tests) covers the economic primitives and, more importantly, *
 An audit suite additionally locks down: dimensional reconciliation of every objective component ($ = $/unit × units; the score equals the sum of its parts; units sold + terminal inventory = starting inventory), monetary-scale invariance, sensitivity monotonicity (waste cost, holding cost, inventory, remaining days, elasticity), PSO agreement with a 1001-point explicit grid on random products, whole-cent rounding invariants, the break-even/gross-profit equivalence, four distinct economic regimes (hold / shallow / moderate / deep markdown), and backtest counterfactual fairness (recommending the current price reproduces the hold strategy exactly).
 
 The dashboard layer has its own tests: the service adapter must serve recommendations byte-identical to the CLI pipeline (parity), aggregates must be exact sums over the served products, scenario evaluations must reproduce the engine's breakdown at the current price and clamp to the allowed range, and the API endpoints are exercised end to end (including 404s, validation, and the not-ready state during startup).
+
+The multi-period suite locks down: agreement with an independent brute-force enumeration of all feasible daily price sequences (small horizons), a one-segment path reproducing the one-shot objective exactly, hold/immediate baselines, wait-then-markdown beating immediate markdown where the economics favor waiting, expiry/inventory/elasticity moving the path in the economically correct direction, every constraint (floor, ceiling, monotonicity, max daily move) on every day of every path, exact decomposition of the evaluator's totals into the daily trajectory, determinism, and constant-path parity between the path backtest and the frozen single-price backtest.
+
+The custom-data suite covers mapping suggestions, row-level validation and reject reasons, currency parsing, duplicate/unknown-id handling, persistence round trips, elasticity recovery from generated history (and every fallback reason: too few observations, no price variation, no history), the zero-sale-day convention, provenance labelling, mode isolation, restart persistence, and the full upload → map → validate → import API flow.
 
 ---
 
@@ -294,10 +392,16 @@ Before production use, these configured assumptions must be replaced with real d
 | Minimum margin / clearance floor | `ConstraintConfig` | 5% / 50% of cost |
 | Markdown friction | `ObjectiveConfig` | 5% of discounted dollars |
 
-Beyond data, two modeling limitations are known and deliberate:
+Beyond data, several modeling limitations are known and deliberate:
 
-- **One-shot pricing.** The engine picks one price per run. The price-path evaluator provides the foundation for staged markdowns (small cut → observe → deeper cut), but full multi-period optimization with daily re-decisions is future work — the current timing comparison evaluates fixed paths only.
+- **Open-loop paths.** The multi-period optimizer commits to a schedule under today's demand forecast; it does not yet re-decide daily as actual sales are observed (closed-loop/dynamic-programming re-optimization is future work). The candidate class is also restricted to at most two downward moves — operationally realistic, but not the unrestricted optimum.
 - **Myopic customers.** Demand depends only on today's price. The markdown literature shows strategic customers who anticipate future discounts can change optimal markdown policies; nothing here models that, and no claim is made either way.
+- **No replenishment or competition.** The engine prices a fixed stock through its remaining life; reordering, competitor prices, and cross-product cannibalization are out of scope.
+- **Custom-data caveats.** Estimates are only as good as the history: elasticities need genuine price variation (fallbacks are labelled when it is absent), transaction files are assumed to be daily aggregates where missing days mean zero sales, and uncertainty in the estimates is reported only coarsely (observation counts, price variation, a stability check) rather than as full confidence intervals.
+
+### Future work
+
+Closed-loop multi-period re-optimization, uncertainty quantification on elasticity estimates, replenishment-aware pricing, competitor-price ingestion, authentication/multi-user deployment, and a database-backed store for large datasets.
 
 ---
 
