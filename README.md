@@ -1,153 +1,126 @@
 # Self-Shelf
 
-### AI-Powered Dynamic Pricing for Retail Inventory
+### Expiry-Aware Dynamic Pricing for Retail Inventory
 
-Self-Shelf is a machine learning-based retail pricing optimization system that combines **demand prediction**, **expiry-aware inventory logic**, and **Particle Swarm Optimization (PSO)** to recommend product prices.
+Self-Shelf is a dynamic-pricing engine for perishable retail inventory. It combines a machine-learning demand forecast with an **explicit economic layer** — price elasticity, expiry pressure, inventory pressure, and expected waste — and uses **Particle Swarm Optimization (PSO)** to pick the price with the best expected economic outcome.
 
-The system is designed around a simple retail objective:
+The design principle:
 
-> **Sell products at the highest practical price while accounting for demand and inventory urgency.**
-
-For fresh inventory, the system focuses on expected profit. For products approaching expiry, it forces markdowns to encourage clearance and reduce potential waste.
+> **The ML model forecasts demand. The economics are encoded explicitly. The optimizer just searches.**
 
 ---
 
-## How It Works
-
-Self-Shelf follows a two-stage optimization pipeline:
+## Architecture
 
 ```text
-Retail Dataset
-     │
-     ▼
-Data Cleaning
-     │
-     ▼
-Feature Engineering
-     │
-     ├── Cost
-     ├── Shelf Life
-     ├── Days to Expiry
-     └── Urgency Ratio
-     │
-     ▼
-Random Forest Regressor
-     │
-     ▼
-Demand Prediction
-     │
-     ▼
-Fresh / Urgent Classification
-     │
-     ▼
-Particle Swarm Optimization
-     │
-     ▼
-AI-Optimized Price
-     │
-     ▼
-Pricing Action + CSV Output
+Demand Model (Random Forest)
+        │  baseline daily demand at the current price
+        ▼
+Economic Layer
+        │  elasticity · expiry pressure · inventory pressure
+        │  expected waste · constraints
+        ▼
+PSO
+        │  searches the constrained price range
+        ▼
+Recommendation
+           price · action · structured economic explanation
 ```
 
-The implementation separates **demand modeling** from **price optimization**. The trained Random Forest acts as the demand simulator, while PSO searches the permitted price range for a profitable price.
+### Why not let the ML model discover the economics?
 
----
+A tree ensemble trained on observed sales does not reliably encode the price–demand relationship: it cannot extrapolate outside the training distribution, and its prediction surface can be flat or even non-monotonic in price. An optimizer driven by such a surface either never marks anything down or does so for spurious reasons.
 
-## Key Features
+Self-Shelf therefore splits responsibilities:
 
-### 1. Demand Prediction
-
-A **Random Forest Regressor** predicts expected demand using:
-
-- Current price
-- Retail price
-- Estimated cost
-- Promotion status
-- Maximum shelf life
-- Urgency ratio
-- Days to expiry
-
-The current implementation trains a Random Forest with:
-
-- **100 estimators**
-- **Maximum depth: 10**
-- **80/20 train-test split**
-
----
-
-### 2. Profit-Based Price Optimization
-
-For each product, candidate prices are evaluated using:
+- The **Random Forest** answers *"how much of this sells per day at today's price?"* — a forecasting problem trees are good at.
+- The **economic layer** answers *"how does demand move when the price moves?"* using an explicit constant-elasticity relationship, which guarantees the monotonic behavior (price ↓ → demand ↑) the optimizer depends on.
 
 ```text
-Expected Profit = (Price - Cost) × Predicted Demand
-```
-
-The PSO optimizer searches through possible prices rather than testing every price manually.
-
-A small volume incentive is also included when candidate prices produce effectively identical profit values, slightly favoring the lower price.
-
----
-
-### 3. Expiry-Aware Pricing
-
-Self-Shelf does not treat every product identically.
-
-Products are classified using their expiry-related features.
-
-#### Fresh Inventory
-
-Fresh products use a pricing range designed to protect the existing margin while allowing markdowns when beneficial.
-
-Possible actions:
-
-```text
-Price Maintained
-Markdown Applied
-```
-
-#### Urgent Inventory
-
-A product becomes urgent when:
-
-```text
-Days to Expiry ≤ 3
-```
-
-or its urgency ratio crosses the configured threshold.
-
-Urgent products are forced into a markdown range:
-
-```text
-Current Price × 30%
-        ↓
-Current Price × 90%
-```
-
-This prevents the optimizer from maintaining or increasing the price when the primary objective should be clearing inventory.
-
-Action:
-
-```text
-Markdown Applied (Clearance)
+demand(P) = baseline_forecast × (P / P_current) ^ elasticity
 ```
 
 ---
 
-## Shelf-Life Model
+## The Economic Layer
 
-The current implementation assigns department-level shelf-life assumptions:
+### Price elasticity
 
-| Department | Maximum Shelf Life |
-|---|---:|
-| Bakery | 7 days |
-| Deli | 5 days |
-| Snacks | 90 days |
-| Beverages | 120 days |
-| Frozen Foods | 180 days |
-| Other | 30 days |
+Each department has an own-price elasticity (e.g. `-1.8` = highly price-sensitive). Elasticities are **estimated from sales data** by department-level log-log regression, with a configurable default as fallback when a department has too few observations or the estimate is not economically credible (non-negative). Nothing in the optimizer reads hard-coded elasticities.
 
-Days to expiry and the urgency ratio are then derived from these values.
+### Expiry pressure
+
+Instead of a binary `days_to_expiry ≤ 3` switch, clearance urgency follows a smooth exponential curve:
+
+```text
+pressure = exp(-(days_to_expiry - 1) / τ)      τ = 5 days by default
+```
+
+~1.0 with one day left, decaying toward 0 as shelf life grows — no arbitrary cliffs.
+
+### Inventory pressure
+
+The engine compares **days of supply** (`inventory / predicted daily demand`) with remaining shelf life. 5 units with 10 days left is a very different problem from 500 units with 10 days left, even at identical expiry dates. The fraction of stock that cannot sell before expiry at the current demand rate is the product's inventory pressure.
+
+### Expected waste
+
+```text
+expected waste units = max(0, inventory − daily demand × days_to_expiry)
+waste cost           = waste units × (unit cost − salvage value) × expiry pressure
+```
+
+The expiry-pressure weighting discounts waste that is still far in the future (there will be later chances to correct course) while charging the full loss for stock expiring now.
+
+### The objective
+
+PSO maximizes a modular economic score:
+
+```text
+score(P) = expected revenue(P)
+         − COGS(P)
+         − expected waste cost(P)
+         − holding cost(P)
+         − markdown friction(P)
+```
+
+subject to constraints:
+
+- minimum margin over cost for healthy stock
+- a clearance floor (fraction of cost) that the margin floor **blends toward smoothly** as expiry pressure rises
+- maximum single-run price drop
+- ceiling at the current price (price increases are disabled by default, configurable)
+- never above the retail/list price
+
+A markdown is only recommended when it **improves** the economic score; otherwise the price is maintained.
+
+### Explanations
+
+Every recommendation carries a structured reason built from the actual numbers, e.g.:
+
+```text
+8.0 days of supply vs 4 days of shelf life remaining;
+expiry pressure is high (0.55) with 4 day(s) left;
+~77 of 154 units are expected to expire unsold at the current price;
+marking down to $2.32 cuts expected waste by ~34 units;
+demand is price-sensitive (elasticity -1.81): predicted daily demand rises from 19.3 to 27.8;
+expected economic outcome improves by $3.76 over the evaluation window
+```
+
+---
+
+## Important Limitation: Synthetic Demand
+
+**The dataset contains no historical sales volume, cost, expiry dates, or inventory levels.** Those are simulated:
+
+- **Demand** comes from an explicit multiplicative simulator:
+  `base × price effect (constant elasticity) × promotion × freshness × seasonality × noise`
+- **Cost** is assumed to be 70% of retail price
+- **Days to expiry** are drawn uniformly within department shelf-life assumptions
+- **Inventory** is drawn as lognormal days-of-supply around a configurable target
+
+This creates an unavoidable circularity: the elasticities the pipeline estimates are the ones the simulator put in. The estimation step exists to demonstrate the *methodology* (recovering price response from sales data), not to prove the model learned real-world economics — **it did not, because no real demand data is available.** With real transaction history, the simulator would be dropped and the same estimation/optimization machinery would run on observed sales.
+
+Every simulated quantity is a named, documented parameter in `src/selfshelf/config.py`, not a magic number.
 
 ---
 
@@ -155,311 +128,108 @@ Days to expiry and the urgency ratio are then derived from these values.
 
 ```text
 Self-Shelf/
-│
-├── main.py
-│   └── Main data pipeline, feature engineering,
-│       model training, inventory logic and output
-│
-├── pso_optimizer.py
-│   └── Particle Swarm Optimization implementation
-│
-├── walmart_large_sample_data_with_categories.csv
-│   └── Retail dataset used by the pipeline
-│
-└── final_optimized_prices.csv
-    └── Generated optimized pricing results
+├── src/
+│   ├── main.py                  CLI entry point
+│   └── selfshelf/
+│       ├── config.py            all business assumptions (dataclasses)
+│       ├── economics.py         elasticity, expiry/inventory pressure,
+│       │                        waste, objective, price bounds
+│       ├── demand.py            demand simulator, RF model, elasticity
+│       │                        estimation
+│       ├── features.py          loading, cleaning, feature engineering
+│       ├── evaluation.py        train/validation/test split + metrics
+│       ├── pso.py               deterministic particle swarm search
+│       ├── optimizer.py         per-product optimization + explanations
+│       └── pipeline.py          end-to-end orchestration
+├── tests/                       unit + behavioral test suite
+├── data/                        retail dataset (prices, departments,
+│                                promotions)
+└── output/                      generated recommendations
 ```
 
 ---
 
-## Technology Stack
+## Model Evaluation
 
-| Technology | Purpose |
-|---|---|
-| Python | Core implementation |
-| Pandas | Data loading and preprocessing |
-| NumPy | Numerical operations and feature engineering |
-| Scikit-learn | Machine learning |
-| Random Forest | Demand prediction |
-| Particle Swarm Optimization | Price optimization |
-| CSV | Dataset and result storage |
+The demand model is evaluated on a leak-free 60/20/20 **train / validation / test** split. Elasticity estimation uses training data only; products to optimize are drawn from the test set. A typical run reports:
+
+```text
+validation  MAE=2.94  RMSE=3.92  R²=0.611
+test        MAE=2.75  RMSE=3.53  R²=0.655
+```
+
+(R² is capped by the simulator's irreducible noise — the model cannot, and should not, explain the lognormal noise term.)
 
 ---
 
-## Dataset
+## Reproducibility
 
-The project uses a Walmart retail dataset containing product, department, pricing, promotion, and related retail attributes.
-
-The pipeline samples **5,000 records** from the available dataset for processing.
-
-During preprocessing, additional variables are derived, including:
-
-```text
-COST
-MAX_SHELF_LIFE
-DAYS_TO_EXPIRY
-URGENCY_RATIO
-DEMAND
-```
-
-The current prototype estimates product cost as:
-
-```text
-COST = PRICE_RETAIL × 0.70
-```
-
-Demand is then generated from the engineered pricing, promotion, and expiry-related features for the prototype's modeling pipeline.
-
----
-
-## Processing Pipeline
-
-### Step 1 — Load Data
-
-The application loads:
-
-```text
-walmart_large_sample_data_with_categories.csv
-```
-
-and samples 5,000 records.
-
-### Step 2 — Clean Data
-
-The pipeline:
-
-- Removes records missing required price/product fields
-- Removes non-positive prices
-- Cleans department and product-name strings
-- Converts promotion information into a binary indicator
-
-### Step 3 — Engineer Features
-
-The system creates cost, shelf-life, expiry, urgency, and demand features.
-
-### Step 4 — Train Demand Model
-
-The data is split into training and testing sets and used to train the Random Forest demand model.
-
-### Step 5 — Determine Inventory Status
-
-Each selected product is classified as either:
-
-```text
-Fresh
-```
-
-or:
-
-```text
-Urgent (Clearance)
-```
-
-### Step 6 — Optimize Price
-
-PSO searches the permitted price range while repeatedly querying the Random Forest for predicted demand.
-
-Each particle represents a candidate price.
-
-The swarm updates:
-
-- Particle position
-- Particle velocity
-- Personal best
-- Global best
-
-until the optimization converges toward a high-profit candidate.
-
-### Step 7 — Generate Pricing Output
-
-Results are written to:
-
-```text
-final_optimized_prices.csv
-```
-
----
-
-## Particle Swarm Optimization
-
-The PSO implementation uses the standard swarm concepts:
-
-```text
-Particle Position
-       │
-       ▼
-Candidate Price
-       │
-       ▼
-Predicted Demand
-       │
-       ▼
-Expected Profit
-       │
-       ▼
-Personal Best / Global Best
-       │
-       ▼
-Updated Velocity
-       │
-       ▼
-New Candidate Price
-```
-
-The current pipeline calls the optimizer with:
-
-- **20 particles**
-- **30 iterations**
-- **Inertia weight:** `0.7`
-- **Cognitive coefficient:** `1.5`
-- **Social coefficient:** `1.5`
-
-Price positions are always constrained to the configured lower and upper bounds.
+A single seed in the configuration drives everything: sampling, simulation, model training, and the PSO search. Each product gets its own deterministic RNG stream derived from the master seed, so results do not depend on how many items are optimized or in what order. Two runs with the same seed produce byte-identical output, and the CLI prints the full configuration used for each run.
 
 ---
 
 ## Running the Project
 
-### Prerequisites
-
-Install:
-
-- Python 3.x
-- pip
-
-### 1. Clone the Repository
-
 ```bash
 git clone https://github.com/Solly2201/Self-Shelf.git
 cd Self-Shelf
+pip install -r requirements.txt
+
+python src/main.py                 # optimize 25 test-set products
+python src/main.py -n 100          # optimize 100
+python src/main.py --sweep         # also write per-product price sweeps
+python src/main.py --seed 7        # different reproducible run
 ```
 
-### 2. Install Dependencies
-
-```bash
-pip install pandas numpy scikit-learn
-```
-
-### 3. Run Self-Shelf
-
-```bash
-python main.py
-```
-
-You will be prompted:
-
-```text
-Enter number of values you want to optimize:
-```
-
-For example:
-
-```text
-Enter number of values you want to optimize: 10
-```
-
-The system will then train the model, optimize the requested products, and generate the output CSV.
-
----
-
-## Output
-
-The generated `final_optimized_prices.csv` contains:
+Output goes to `output/final_optimized_prices.csv` with columns including:
 
 | Field | Description |
 |---|---|
-| `SKU` | Product identifier |
-| `Product_Name` | Product name |
-| `Department` | Product department |
-| `Wholesale_Cost` | Estimated product cost |
-| `Old_Walmart_Price` | Existing price |
-| `New_AI_Optimized_Price` | Recommended price |
-| `Days_To_Expiry` | Estimated remaining shelf life |
-| `Urgency_Status` | Fresh / Urgent |
-| `Action_Taken` | Pricing action |
+| `Optimized_Price`, `Markdown_Percentage`, `Action` | the recommendation |
+| `Days_To_Expiry`, `Inventory_Units`, `Days_Of_Supply` | inventory situation |
+| `Elasticity`, `Expiry_Pressure` | economic inputs |
+| `Predicted_Demand_Current` / `_Optimized` | demand at both prices |
+| `Expected_Revenue`, `Expected_Profit` | over the evaluation window |
+| `Expected_Waste_Units` (+ at current price) | waste impact of the markdown |
+| `Economic_Reason` | structured explanation |
 
-Example:
+`--sweep` additionally writes `final_optimized_prices_sweep.csv`: demand, revenue, profit, waste, and economic score across the feasible price range for each product — the data behind price–demand and profit curves.
 
-```text
-SKU        Old Price    AI Price    Days    Status
-SKU001     $4.99        $4.49       2       Urgent
-SKU002     $7.99        $7.99       30      Fresh
+---
+
+## Testing
+
+```bash
+python -m pytest
 ```
 
----
+The suite (≈90 tests) covers the economic primitives and, more importantly, **business behavior**:
 
-## Design Decisions
-
-### Why Random Forest?
-
-Random Forest provides a practical nonlinear regression model for capturing relationships between pricing, promotions, inventory characteristics, and demand without requiring a strictly linear relationship.
-
-### Why PSO?
-
-The optimization problem is continuous: the system needs to search through a range of possible prices.
-
-PSO is suitable for this because it can explore a continuous search space using a population of candidate solutions while balancing exploration and exploitation.
-
-### Why Separate Prediction and Optimization?
-
-The model answers:
-
-```text
-"What demand should we expect at this price?"
-```
-
-The optimizer answers:
-
-```text
-"Given that demand, what price should we choose?"
-```
-
-Separating these responsibilities makes the pricing pipeline easier to reason about and extend.
+- healthy inventory is not marked down
+- overstocked near-expiry stock receives meaningful downward pressure that measurably reduces expected waste
+- extremely urgent stock gets strong clearance behavior within configured bounds
+- highly price-sensitive products get markdowns that *increase* expected profit
+- price-insensitive products keep their price
+- prices always respect bounds, waste/sales are never negative, zero-demand edge cases are safe
+- the whole pipeline is reproducible end-to-end given a seed
 
 ---
 
-## Limitations
+## Assumptions That Need Real Business Data
 
-Self-Shelf is a prototype and the current implementation has several limitations:
+Before production use, these configured assumptions must be replaced with real data:
 
-- Demand behavior is dependent on the available dataset and engineered assumptions.
-- Product cost is estimated rather than obtained from real procurement data.
-- Days to expiry are simulated during preprocessing.
-- Demand is generated using prototype business logic rather than learned from actual historical sales volume.
-- Random Forest is not designed to reliably extrapolate far outside the observed training distribution.
-- The system currently operates on batch data rather than a live POS stream.
-- Pricing is optimized for selected products rather than a continuously running store-wide system.
-- External factors such as competitors, weather, local events, and real-time customer behavior are not currently modeled.
-
-These limitations make the current project best suited as an academic/prototype demonstration of an AI-assisted retail pricing pipeline.
-
----
-
-## Future Scope
-
-Potential extensions include:
-
-- Real-time POS transaction streaming
-- Kafka-based event processing
-- Live inventory integration
-- Real historical demand modeling
-- Deep learning-based demand forecasting
-- Reinforcement learning for dynamic pricing
-- Competitor price monitoring
-- Customer segmentation
-- Personalized promotions
-- Multi-store optimization
-- Distributed optimization using Spark
-- Explainable AI for pricing recommendations
-- Integration with Electronic Shelf Labels (ESLs)
-- ERP integration for automated price updates
-
----
-
-## Repository
-
-**GitHub:**  
-https://github.com/Solly2201/Self-Shelf
+| Assumption | Config | Default |
+|---|---|---|
+| Unit cost | `cost_ratio_of_retail` | 70% of retail |
+| Department elasticities (fallback) | `ElasticityConfig` | −0.9 … −1.8 |
+| Shelf life per department | `ExpiryConfig` | 5–180 days |
+| Expiry-pressure time scale | `tau_days` | 5 days |
+| On-hand inventory | `InventoryConfig` | ~6 days of supply |
+| Salvage value / disposal cost | `WasteConfig` | 0 |
+| Holding cost | `holding_cost_per_unit_day` | 0 |
+| Minimum margin / clearance floor | `ConstraintConfig` | 5% / 50% of cost |
+| Markdown friction | `ObjectiveConfig` | 5% of discounted dollars |
 
 ---
 
@@ -467,7 +237,7 @@ https://github.com/Solly2201/Self-Shelf
 
 **Shreshtha Bindal**
 
-Computer Engineering  
+Computer Engineering
 Mukesh Patel School of Technology Management & Engineering (MPSTME), NMIMS, Mumbai
 
 GitHub: https://github.com/Solly2201
