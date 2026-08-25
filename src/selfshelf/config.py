@@ -169,6 +169,24 @@ class SimulatorConfig:
 
 
 @dataclass
+class AdaptiveConfig:
+    """Closed-loop re-optimization behavior.
+
+    These parameters govern only the adaptive controller layered on top of
+    the frozen engine; they never alter how a single optimization values a
+    price.
+    """
+
+    # Exponential-smoothing weight given to today's observed sales when
+    # updating the demand-level belief (0 = never learn, 1 = trust only
+    # today). Elasticity is NOT updated online — one day of sales at one
+    # price carries no information about the price response.
+    demand_learning_rate: float = 0.3
+    # Whether the controller updates its demand-level belief at all.
+    update_demand_beliefs: bool = True
+
+
+@dataclass
 class PricingConfig:
     """Top-level configuration for a full pricing run."""
 
@@ -183,6 +201,7 @@ class PricingConfig:
     objective: ObjectiveConfig = field(default_factory=ObjectiveConfig)
     pso: PSOConfig = field(default_factory=PSOConfig)
     simulator: SimulatorConfig = field(default_factory=SimulatorConfig)
+    adaptive: AdaptiveConfig = field(default_factory=AdaptiveConfig)
 
     def describe(self) -> Dict[str, object]:
         """Flat summary of the assumptions behind a run, for logging."""

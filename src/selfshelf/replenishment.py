@@ -145,6 +145,7 @@ def _replay(
     config: PricingConfig,
     daily_prices: Sequence[float],
     schedule: ReplenishmentSchedule,
+    fresh_inventory_units: float = 0.0,
 ) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
     """Day-by-day replay of a price path with future deliveries.
 
@@ -158,7 +159,11 @@ def _replay(
     window = min(p.days_to_expiry, cfg.objective.planning_horizon_days)
 
     old = p.inventory_units       # expires at p.days_to_expiry
-    fresh = 0.0                   # delivered during the window; no expiry
+    # Fresh stock: already-delivered units the caller knows are newer than
+    # the expiring lot (used by the closed-loop controller once deliveries
+    # have landed), plus deliveries arriving during the window. No expiry
+    # within the window.
+    fresh = max(0.0, float(fresh_inventory_units))
     received = 0.0
     elapsed = 0.0
     revenue = cogs = holding = friction = 0.0
@@ -205,8 +210,10 @@ def _replay(
             "markdown_cost": day_friction,
         })
 
-        old -= sold_old
-        fresh -= sold_fresh
+        # Guard against float drift in the lot split going microscopically
+        # negative (min/subtraction round-off).
+        old = max(0.0, old - sold_old)
+        fresh = max(0.0, fresh - sold_fresh)
         elapsed += day_len
         last_demand = demand
 
@@ -249,15 +256,18 @@ def evaluate_price_path_with_replenishment(
     config: PricingConfig,
     schedule: Schedule,
     replenishment: ReplenishmentSchedule,
+    fresh_inventory_units: float = 0.0,
 ) -> Dict[str, float]:
     """Economic value of a price path given known future deliveries.
 
-    With an empty replenishment schedule this equals the frozen
-    ``economics.evaluate_price_path`` exactly (see tests).
+    With an empty replenishment schedule and no on-hand fresh stock this
+    equals the frozen ``economics.evaluate_price_path`` exactly (tests).
     """
     horizon = path_horizon_days(product, config)
     daily = schedule_to_daily(schedule, horizon)
-    totals, _ = _replay(product, config, daily, replenishment)
+    totals, _ = _replay(
+        product, config, daily, replenishment, fresh_inventory_units
+    )
     return totals
 
 
@@ -266,11 +276,14 @@ def replenishment_trajectory(
     config: PricingConfig,
     schedule: Schedule,
     replenishment: ReplenishmentSchedule,
+    fresh_inventory_units: float = 0.0,
 ) -> List[Dict[str, float]]:
     """Day-by-day expected trajectory including delivery events."""
     horizon = path_horizon_days(product, config)
     daily = schedule_to_daily(schedule, horizon)
-    _, rows = _replay(product, config, daily, replenishment)
+    _, rows = _replay(
+        product, config, daily, replenishment, fresh_inventory_units
+    )
     return rows
 
 
@@ -285,6 +298,7 @@ def optimize_path_with_replenishment(
     single_price: Optional[float] = None,
     max_moves: int = DEFAULT_MAX_MOVES,
     num_levels: int = DEFAULT_NUM_LEVELS,
+    fresh_inventory_units: float = 0.0,
 ) -> PathResult:
     """Exhaustive staged-markdown search that sees future deliveries.
 
@@ -307,7 +321,8 @@ def optimize_path_with_replenishment(
 
     best_schedule: Schedule = [(horizon, cur)]
     best_eval = evaluate_price_path_with_replenishment(
-        product, config, best_schedule, replenishment
+        product, config, best_schedule, replenishment,
+        fresh_inventory_units,
     )
     best_score = best_eval["score"]
     hold_eval = best_eval
@@ -321,7 +336,8 @@ def optimize_path_with_replenishment(
         if n_candidates == 1:
             continue  # hold path already evaluated above
         evaluation = evaluate_price_path_with_replenishment(
-            product, config, schedule, replenishment
+            product, config, schedule, replenishment,
+            fresh_inventory_units,
         )
         if evaluation["score"] > best_score + _EPS:
             best_schedule = schedule
@@ -331,7 +347,8 @@ def optimize_path_with_replenishment(
     single_eval = None
     if single_price is not None and single_price < cur - _EPS:
         single_eval = evaluate_price_path_with_replenishment(
-            product, config, [(horizon, float(single_price))], replenishment
+            product, config, [(horizon, float(single_price))], replenishment,
+            fresh_inventory_units,
         )
 
     result = PathResult(
