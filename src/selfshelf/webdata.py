@@ -1,16 +1,27 @@
 """Read-side service layer for the dashboard.
 
-Runs the frozen pricing engine once and holds the rich per-product objects
-(`ProductContext`, `OptimizationResult`) in memory so the web API can serve
-normalized recommendation data, high-resolution price sweeps, and on-demand
-scenario evaluations — all computed by the engine itself. No economic
-formula lives outside `selfshelf.economics` / `selfshelf.optimizer`.
+Runs the frozen pricing engine once per data source and holds the rich
+per-product objects (`ProductContext`, `OptimizationResult`) in memory so
+the web API can serve normalized recommendation data, high-resolution price
+sweeps, multi-period price paths, and on-demand scenario evaluations — all
+computed by the engine itself. No economic formula lives outside
+`selfshelf.economics` / `selfshelf.optimizer` / `selfshelf.pathopt`.
 
-The run mirrors `pipeline.run_pipeline` step for step (same seed streams,
-same per-product RNG derivation), so the recommendations served here are
-identical to the CLI output. `tests/test_webdata.py` locks that parity down.
+Two concrete services share one presentation layer:
+
+- ``PricingService``: the synthetic demo source. The run mirrors
+  ``pipeline.run_pipeline`` step for step (same seed streams, same
+  per-product RNG derivation), so the recommendations served here are
+  identical to the CLI output. `tests/test_webdata.py` locks that parity
+  down.
+- ``CustomPricingService``: a user-imported dataset (see
+  ``selfshelf.customdata``). Elasticities and baseline demand come from
+  the imported transaction history with transparent fallbacks; there is no
+  synthetic backtest because no ground-truth simulator exists for real
+  data.
 """
 
+import io
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,10 +31,25 @@ import numpy as np
 
 from .backtest import backtest_recommendations
 from .config import PricingConfig
+from .customdata import CustomDataset, estimate_demand_params, load_dataset
 from .demand import DemandModel, estimate_elasticities
-from .economics import EconomicObjective, days_of_supply
+from .economics import (
+    EconomicObjective,
+    ProductContext,
+    days_of_supply,
+    evaluate_price_path,
+    inventory_pressure,
+)
 from .evaluation import evaluate_model, split_data
 from .optimizer import OptimizationResult, optimize_product, price_sweep
+from .pathbacktest import backtest_price_paths
+from .pathopt import (
+    PathResult,
+    optimize_path,
+    path_price_floor,
+    path_trajectory,
+    validate_daily_prices,
+)
 from .pipeline import _product_context, _recommendation_row, prepare_data
 
 import pandas as pd
@@ -65,81 +91,28 @@ class ProductRecord:
     department: str
     result: OptimizationResult
     csv_row: Dict[str, object]
+    # Custom-data provenance: where elasticity/baseline demand came from.
+    provenance: Optional[Dict[str, object]] = None
 
 
-@dataclass
-class PricingService:
-    """Computes and caches everything the dashboard API serves."""
+class BasePricingService:
+    """Shared presentation layer over a computed set of ProductRecords.
 
-    data_path: str
-    num_items: int = 50
-    config: PricingConfig = field(default_factory=PricingConfig)
+    Subclasses implement ``compute()`` (filling ``_products``/``_order``)
+    and ``meta()``; every view below only reads engine outputs.
+    """
 
-    def __post_init__(self):
+    source = "unknown"
+
+    def _init_state(self):
         self._products: Dict[str, ProductRecord] = {}
         self._order: List[str] = []
         self._recommendations: Optional[pd.DataFrame] = None
         self._backtest: Optional[Dict[str, object]] = None
-        self._model_report: Dict[str, Dict[str, float]] = {}
-        self._elasticities: Dict[str, object] = {}
         self._sweep_cache: Dict[str, List[Dict[str, float]]] = {}
+        self._path_cache: Dict[str, PathResult] = {}
+        self._path_backtest: Optional[Dict[str, object]] = None
         self.generated_at: Optional[str] = None
-
-    # -- computation ---------------------------------------------------------
-
-    def compute(self) -> "PricingService":
-        """Run the engine end to end, exactly as the CLI pipeline does."""
-        config = self.config
-        rng = np.random.default_rng(config.seed)
-
-        df = prepare_data(self.data_path, config, rng)
-        split = split_data(df, seed=config.seed)
-
-        model = DemandModel(seed=config.seed).fit(split.train)
-        self._model_report = evaluate_model(model, split)
-        estimates = estimate_elasticities(split.train, config)
-
-        items = split.test.head(self.num_items)
-        baselines = model.predict(items)
-
-        rows: List[Dict[str, object]] = []
-        for pos, (_, row) in enumerate(items.iterrows()):
-            estimate = estimates.get(row["DEPARTMENT"])
-            elasticity = (
-                estimate.elasticity if estimate else config.elasticity.default
-            )
-            product = _product_context(row, float(baselines[pos]), elasticity)
-            product_rng = np.random.default_rng([config.seed, pos])
-            result = optimize_product(product, config, product_rng)
-
-            csv_row = _recommendation_row(row, result)
-            rows.append(csv_row)
-            sku = str(csv_row["SKU"])
-            self._products[sku] = ProductRecord(
-                sku=sku,
-                name=str(row["PRODUCT_NAME"]),
-                department=str(row["DEPARTMENT"]),
-                result=result,
-                csv_row=csv_row,
-            )
-            self._order.append(sku)
-
-        self._recommendations = pd.DataFrame(rows)
-        self._backtest = backtest_recommendations(
-            items, self._recommendations, config
-        )
-        self._elasticities = {
-            dept: {
-                "elasticity": round(est.elasticity, 3),
-                "n_observations": est.n_observations,
-                "source": est.source,
-            }
-            for dept, est in estimates.items()
-        }
-        self.generated_at = datetime.now(timezone.utc).isoformat(
-            timespec="seconds"
-        )
-        return self
 
     @property
     def ready(self) -> bool:
@@ -157,7 +130,7 @@ class PricingService:
         cur, opt = r.current, r.optimized
         dos = days_of_supply(p.inventory_units, cur["daily_demand"])
         pressure = record.csv_row["Inventory_Pressure"]
-        return {
+        summary = {
             "id": record.sku,
             "name": record.name,
             "department": record.department,
@@ -199,6 +172,9 @@ class PricingService:
                 ),
             },
         }
+        if record.provenance:
+            summary["provenance"] = record.provenance
+        return summary
 
     @staticmethod
     def _econ(breakdown: Dict[str, float]) -> Dict[str, object]:
@@ -213,6 +189,20 @@ class PricingService:
             "terminal_inventory": _f(breakdown["terminal_inventory"], 2),
             "holding_cost": _f(breakdown["holding_cost"], 2),
             "economic_value": _f(breakdown["score"], 2),
+        }
+
+    @staticmethod
+    def _path_econ(evaluation: Dict[str, float]) -> Dict[str, object]:
+        """Normalize an ``evaluate_price_path`` result for the API."""
+        return {
+            "revenue": _f(evaluation["expected_revenue"], 2),
+            "gross_profit": _f(evaluation["gross_profit"], 2),
+            "waste_units": _f(evaluation["expected_waste_units"], 2),
+            "waste_cost": _f(evaluation["expected_waste_cost"], 2),
+            "holding_cost": _f(evaluation["holding_cost"], 2),
+            "markdown_cost": _f(evaluation["markdown_cost"], 2),
+            "terminal_inventory": _f(evaluation["terminal_inventory"], 2),
+            "economic_value": _f(evaluation["score"], 2),
         }
 
     def products(self) -> List[Dict[str, object]]:
@@ -277,6 +267,188 @@ class PricingService:
             "breakdown": self._econ(objective.breakdown(clamped)),
             "baseline": self._econ(record.result.current),
         }
+
+    # -- multi-period paths --------------------------------------------------
+
+    def _path_result(self, sku: str) -> Optional[PathResult]:
+        record = self._products.get(sku)
+        if record is None:
+            return None
+        if sku not in self._path_cache:
+            self._path_cache[sku] = optimize_path(
+                record.result.product,
+                self.config,
+                single_price=record.result.optimized_price,
+            )
+        return self._path_cache[sku]
+
+    def path(self, sku: str) -> Optional[Dict[str, object]]:
+        """Recommended multi-period schedule with hold/immediate baselines."""
+        result = self._path_result(sku)
+        if result is None:
+            return None
+        record = self._products[sku]
+        product = record.result.product
+        horizon = result.horizon_days
+        cur = product.current_price
+
+        trajectory = [
+            {k: _f(v, 3) if k != "day" else int(v) for k, v in row.items()}
+            for row in path_trajectory(product, self.config, result.schedule)
+        ]
+
+        strategies = {
+            "recommended": {
+                "daily_prices": [_f(p, 2) for p in result.daily_prices],
+                "econ": self._path_econ(result.evaluation),
+            },
+            "hold": {
+                "daily_prices": [_f(cur, 2)] * horizon,
+                "econ": self._path_econ(result.hold),
+            },
+        }
+        if result.single is not None:
+            strategies["immediate"] = {
+                "daily_prices": [_f(result.single_price, 2)] * horizon,
+                "price": _f(result.single_price, 2),
+                "econ": self._path_econ(result.single),
+            }
+
+        return {
+            "id": record.sku,
+            "name": record.name,
+            "action": result.action,
+            "horizon_days": horizon,
+            "daily_prices": [_f(p, 2) for p in result.daily_prices],
+            "schedule": [
+                {"days": int(round(days)), "price": _f(price, 2)}
+                for days, price in result.schedule
+            ],
+            "strategies": strategies,
+            "improvement_vs_hold": _f(result.improvement_vs_hold, 2),
+            "improvement_vs_single": (
+                _f(result.improvement_vs_single, 2)
+                if result.improvement_vs_single is not None else None
+            ),
+            "trajectory": trajectory,
+            "reasons": list(result.reasons),
+            "constraints": {
+                "floor": _f(path_price_floor(product, self.config), 2),
+                "ceiling": _f(cur, 2),
+                "max_daily_drop_pct": _f(
+                    100 * self.config.constraints.max_daily_price_drop, 0
+                ),
+            },
+        }
+
+    def path_scenario(
+        self, sku: str, daily_prices: List[float]
+    ) -> Optional[Dict[str, object]]:
+        """Engine valuation of a user-proposed daily price path."""
+        record = self._products.get(sku)
+        if record is None:
+            return None
+        product = record.result.product
+        prices, errors = validate_daily_prices(
+            product, self.config, daily_prices
+        )
+        if errors:
+            return {"errors": errors}
+        from .pathopt import daily_to_schedule
+
+        schedule = daily_to_schedule(prices)
+        evaluation = evaluate_price_path(product, self.config, schedule)
+        recommended = self._path_result(sku)
+        return {
+            "errors": [],
+            "daily_prices": [_f(p, 2) for p in prices],
+            "econ": self._path_econ(evaluation),
+            "trajectory": [
+                {
+                    k: _f(v, 3) if k != "day" else int(v)
+                    for k, v in row.items()
+                }
+                for row in path_trajectory(product, self.config, schedule)
+            ],
+            "compare": {
+                "hold": self._path_econ(recommended.hold),
+                "recommended": self._path_econ(recommended.evaluation),
+            },
+        }
+
+    def path_backtest(self) -> Optional[Dict[str, object]]:
+        """Synthetic-only; overridden by the synthetic service."""
+        return None
+
+    # -- exports -------------------------------------------------------------
+
+    def export_recommendations_csv(self) -> str:
+        rows = []
+        for summary in self.products():
+            cur = summary["economics"]["current"]
+            rec = summary["economics"]["recommended"]
+            row = {
+                "Product_ID": summary["id"],
+                "Product_Name": summary["name"],
+                "Department": summary["department"],
+                "Action": summary["action"],
+                "Current_Price": summary["pricing"]["current"],
+                "Recommended_Price": summary["pricing"]["recommended"],
+                "Markdown_Pct": summary["pricing"]["markdown_pct"],
+                "Inventory_Units": summary["inventory"]["units"],
+                "Days_To_Expiry": summary["inventory"]["days_to_expiry"],
+                "Elasticity": summary["demand"]["elasticity"],
+                "Economic_Value_Current": cur["economic_value"],
+                "Economic_Value_Recommended": rec["economic_value"],
+                "Economic_Value_Improvement":
+                    summary["economics"]["improvement"],
+                "Expected_Waste_Current": cur["waste_units"],
+                "Expected_Waste_Recommended": rec["waste_units"],
+                "Sell_Through_Current": cur["sell_through"],
+                "Sell_Through_Recommended": rec["sell_through"],
+            }
+            if "provenance" in summary:
+                row["Elasticity_Source"] = summary["provenance"].get(
+                    "elasticity_source"
+                )
+                row["Baseline_Demand_Source"] = summary["provenance"].get(
+                    "baseline_source"
+                )
+            rows.append(row)
+        return self._to_csv(pd.DataFrame(rows))
+
+    def export_paths_csv(self) -> str:
+        rows = []
+        for sku in self._order:
+            payload = self.path(sku)
+            if payload is None:
+                continue
+            for day_row in payload["trajectory"]:
+                rows.append({
+                    "Product_ID": payload["id"],
+                    "Product_Name": payload["name"],
+                    "Day": day_row["day"],
+                    "Recommended_Price": day_row["price"],
+                    "Expected_Daily_Demand": day_row["daily_demand"],
+                    "Expected_Sales_Units":
+                        day_row["expected_sales_units"],
+                    "Start_Inventory": day_row["start_inventory"],
+                    "End_Inventory": day_row["end_inventory"],
+                    "Expected_Revenue": day_row["expected_revenue"],
+                    "Projected_Waste_Units":
+                        day_row.get("projected_waste_units"),
+                    "Path_Economic_Value":
+                        payload["strategies"]["recommended"]["econ"][
+                            "economic_value"
+                        ],
+                })
+        return self._to_csv(pd.DataFrame(rows))
+
+    @staticmethod
+    def _to_csv(frame: pd.DataFrame) -> str:
+        buffer = io.StringIO()
+        frame.to_csv(buffer, index=False)
+        return buffer.getvalue()
 
     # -- aggregates ----------------------------------------------------------
 
@@ -345,19 +517,8 @@ class PricingService:
             out[strategy] = {k: _f(v, 2) for k, v in s.items()}
         return out
 
-    def meta(self) -> Dict[str, object]:
-        return {
-            "generated_at": self.generated_at,
-            "seed": self.config.seed,
-            "num_items": self.num_items,
-            "synthetic": True,
-            "data_source": "Synthetic retail simulation",
-            "model_report": {
-                split: {k: _f(v, 3) for k, v in metrics.items()}
-                for split, metrics in self._model_report.items()
-            },
-            "elasticities": self._elasticities,
-        }
+    def meta(self) -> Dict[str, object]:  # pragma: no cover - abstract
+        raise NotImplementedError
 
     def analytics(self) -> Dict[str, object]:
         products = self.products()
@@ -444,5 +605,233 @@ class PricingService:
                 "value_improvement": _f(
                     sum(p["economics"]["improvement"] for p in products), 2),
             },
+            "path_backtest": self.path_backtest(),
             "meta": self.meta(),
+        }
+
+
+@dataclass
+class PricingService(BasePricingService):
+    """Synthetic demo source: computes and caches everything the dashboard
+    API serves, mirroring the CLI pipeline exactly."""
+
+    data_path: str
+    num_items: int = 50
+    config: PricingConfig = field(default_factory=PricingConfig)
+
+    source = "synthetic"
+
+    def __post_init__(self):
+        self._init_state()
+        self._items: Optional[pd.DataFrame] = None
+        self._model_report: Dict[str, Dict[str, float]] = {}
+        self._elasticities: Dict[str, object] = {}
+
+    # -- computation ---------------------------------------------------------
+
+    def compute(self) -> "PricingService":
+        """Run the engine end to end, exactly as the CLI pipeline does."""
+        config = self.config
+        rng = np.random.default_rng(config.seed)
+
+        df = prepare_data(self.data_path, config, rng)
+        split = split_data(df, seed=config.seed)
+
+        model = DemandModel(seed=config.seed).fit(split.train)
+        self._model_report = evaluate_model(model, split)
+        estimates = estimate_elasticities(split.train, config)
+
+        items = split.test.head(self.num_items)
+        baselines = model.predict(items)
+
+        rows: List[Dict[str, object]] = []
+        for pos, (_, row) in enumerate(items.iterrows()):
+            estimate = estimates.get(row["DEPARTMENT"])
+            elasticity = (
+                estimate.elasticity if estimate else config.elasticity.default
+            )
+            product = _product_context(row, float(baselines[pos]), elasticity)
+            product_rng = np.random.default_rng([config.seed, pos])
+            result = optimize_product(product, config, product_rng)
+
+            csv_row = _recommendation_row(row, result)
+            rows.append(csv_row)
+            sku = str(csv_row["SKU"])
+            self._products[sku] = ProductRecord(
+                sku=sku,
+                name=str(row["PRODUCT_NAME"]),
+                department=str(row["DEPARTMENT"]),
+                result=result,
+                csv_row=csv_row,
+            )
+            self._order.append(sku)
+
+        self._items = items
+        self._recommendations = pd.DataFrame(rows)
+        self._backtest = backtest_recommendations(
+            items, self._recommendations, config
+        )
+        self._elasticities = {
+            dept: {
+                "elasticity": round(est.elasticity, 3),
+                "n_observations": est.n_observations,
+                "source": est.source,
+            }
+            for dept, est in estimates.items()
+        }
+        self.generated_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return self
+
+    def path_backtest(self) -> Optional[Dict[str, object]]:
+        """Hold vs immediate markdown vs optimized path, replayed under the
+        synthetic simulator with common random numbers. Cached."""
+        if not self.ready or self._items is None:
+            return None
+        if self._path_backtest is None:
+            immediate = [
+                float(self._recommendations.iloc[pos]["Recommended_Price"])
+                for pos in range(len(self._order))
+            ]
+            daily_paths = []
+            for sku in self._order:
+                result = self._path_result(sku)
+                daily_paths.append([float(p) for p in result.daily_prices])
+            self._path_backtest = backtest_price_paths(
+                self._items, immediate, daily_paths, self.config
+            )
+        return self._path_backtest
+
+    def meta(self) -> Dict[str, object]:
+        return {
+            "generated_at": self.generated_at,
+            "seed": self.config.seed,
+            "num_items": self.num_items,
+            "source": "synthetic",
+            "synthetic": True,
+            "data_source": "Synthetic retail simulation",
+            "model_report": {
+                split: {k: _f(v, 3) for k, v in metrics.items()}
+                for split, metrics in self._model_report.items()
+            },
+            "elasticities": self._elasticities,
+        }
+
+
+class CustomPricingService(BasePricingService):
+    """User-imported data source.
+
+    Same frozen engine, same presentation layer — but demand parameters
+    come from the imported history (with labelled fallbacks) and there is
+    deliberately no synthetic backtest: no ground-truth simulator exists
+    for real data, so Self-Shelf does not fabricate one.
+    """
+
+    source = "custom"
+
+    def __init__(
+        self,
+        directory: str,
+        config: Optional[PricingConfig] = None,
+        dataset: Optional[CustomDataset] = None,
+    ):
+        self.directory = directory
+        self.config = config or PricingConfig()
+        self._dataset = dataset
+        self._categories: Dict[str, Dict[str, object]] = {}
+        self._quality: Dict[str, object] = {}
+        self._imported_at: Optional[str] = None
+        self._init_state()
+
+    def compute(self) -> "CustomPricingService":
+        dataset = self._dataset or load_dataset(self.directory)
+        if dataset is None:
+            raise ValueError(
+                "no imported dataset found — upload data on the Data page"
+            )
+        if not len(dataset.products):
+            raise ValueError("the imported dataset contains no products")
+        if not len(dataset.transactions):
+            raise ValueError(
+                "the imported dataset has no transaction history; "
+                "Self-Shelf cannot estimate demand without observed sales"
+            )
+        self._dataset = dataset
+        config = self.config
+
+        params, categories = estimate_demand_params(dataset, config)
+        self._categories = categories
+        self._quality = dataset.quality_summary()
+        self._imported_at = dataset.meta.get("imported_at")
+
+        rows: List[Dict[str, object]] = []
+        for pos, (_, row) in enumerate(dataset.products.iterrows()):
+            pid = str(row["product_id"])
+            prm = params[pid]
+            product = ProductContext(
+                current_price=float(row["current_price"]),
+                retail_price=float(row["retail_price"]),
+                unit_cost=float(row["cost"]),
+                inventory_units=float(row["inventory"]),
+                days_to_expiry=float(row["days_to_expiry"]),
+                baseline_daily_demand=prm.baseline_daily_demand,
+                elasticity=prm.elasticity,
+            )
+            product_rng = np.random.default_rng([config.seed, pos])
+            result = optimize_product(product, config, product_rng)
+            pseudo_row = pd.Series({
+                "SKU": pid,
+                "PRODUCT_NAME": str(row["product_name"]),
+                "DEPARTMENT": str(row["category"]),
+            })
+            csv_row = _recommendation_row(pseudo_row, result)
+            rows.append(csv_row)
+            self._products[pid] = ProductRecord(
+                sku=pid,
+                name=str(row["product_name"]),
+                department=str(row["category"]),
+                result=result,
+                csv_row=csv_row,
+                provenance={
+                    "elasticity_source": prm.elasticity_source,
+                    "elasticity_n_obs": prm.elasticity_n_obs,
+                    "elasticity_reason": prm.elasticity_reason,
+                    "baseline_source": prm.baseline_source,
+                    "baseline_n_days": prm.baseline_n_days,
+                },
+            )
+            self._order.append(pid)
+
+        self._recommendations = pd.DataFrame(rows)
+        self._backtest = None  # no ground-truth simulator for real data
+        self.generated_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return self
+
+    def meta(self) -> Dict[str, object]:
+        return {
+            "generated_at": self.generated_at,
+            "seed": self.config.seed,
+            "num_items": len(self._order),
+            "source": "custom",
+            "synthetic": False,
+            "data_source": "Custom data import",
+            "imported_at": self._imported_at,
+            "quality": self._quality,
+            "model_report": {},
+            "elasticities": {
+                cat: {
+                    "elasticity": _f(info["elasticity"], 3),
+                    "n_observations": info["n_observations"],
+                    "source": (
+                        "estimated" if info["source"] == "estimated"
+                        else "default"
+                    ),
+                    "reason": info["reason"],
+                    "price_variation": _f(info["price_variation"], 4),
+                }
+                for cat, info in self._categories.items()
+            },
         }

@@ -72,7 +72,21 @@
 
   /* ---------- API ---------- */
 
-  const cache = {};
+  let cache = {};
+
+  function clearCache() { cache = {}; }
+
+  /* Active data source, refreshed by boot() and after imports/switches. */
+  const appMode = { source: "synthetic", synthetic: true, hasCustom: false };
+
+  function describeDetail(detail) {
+    if (typeof detail === "string") return detail;
+    if (detail && detail.message) {
+      const extra = (detail.errors || []).join("; ");
+      return detail.message + (extra ? ` — ${extra}` : "");
+    }
+    return JSON.stringify(detail);
+  }
 
   async function api(path, { fresh } = {}) {
     if (!fresh && cache[path]) return cache[path];
@@ -84,11 +98,69 @@
     }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.detail || `Request failed (${res.status})`);
+      throw new Error(
+        body.detail ? describeDetail(body.detail)
+          : `Request failed (${res.status})`);
     }
     const data = await res.json();
     cache[path] = data;
     return data;
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(
+        data.detail ? describeDetail(data.detail)
+          : `Request failed (${res.status})`);
+    }
+    return data;
+  }
+
+  async function apiUpload(path, file) {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(path, { method: "POST", body: form });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(
+        data.detail ? describeDetail(data.detail)
+          : `Upload failed (${res.status})`);
+    }
+    return data;
+  }
+
+  function updateModeBadge() {
+    const badge = document.getElementById("mode-badge");
+    const footer = document.getElementById("footer-note");
+    if (appMode.source === "custom") {
+      badge.textContent = "Custom data";
+      badge.classList.add("custom");
+      badge.title = "Recommendations are computed from your imported data";
+      footer.textContent = "Self-Shelf pricing engine — running on imported "
+        + "custom data. Recommendations depend on the quality of the "
+        + "imported history.";
+    } else {
+      badge.textContent = "Simulation mode";
+      badge.classList.remove("custom");
+      badge.title = "All data comes from the synthetic retail simulator";
+      footer.textContent = "Self-Shelf pricing engine — synthetic retail "
+        + "simulation. Results are not real-world retail performance.";
+    }
+  }
+
+  async function refreshMode() {
+    const status = await api("/api/status", { fresh: true });
+    appMode.source = status.source;
+    appMode.synthetic = status.source === "synthetic";
+    appMode.hasCustom = !!(status.custom && status.custom.available);
+    updateModeBadge();
+    return status;
   }
 
   /* ---------- shared view states ---------- */
@@ -144,7 +216,9 @@
     view.innerHTML = `
       <h1 class="page-title">Overview</h1>
       <p class="page-subtitle">Expiry-aware pricing recommendations for
-      ${k.products} products in the synthetic simulation. Accepting all
+      ${k.products} products in ${data.meta && data.meta.synthetic === false
+        ? "your imported dataset"
+        : "the synthetic simulation"}. Accepting all
       recommendations changes the expected economics below.</p>
 
       <div class="kpis">
@@ -214,7 +288,9 @@
 
   function renderBacktest(box, backtest) {
     if (!backtest) {
-      box.innerHTML = `<div class="empty-note">No backtest available.</div>`;
+      box.innerHTML = `<div class="empty-note">The counterfactual backtest
+        needs the synthetic simulator's ground truth, which does not exist
+        for imported data — so Self-Shelf does not fabricate one.</div>`;
       return;
     }
     const rows = [
@@ -401,6 +477,8 @@
               ${f.label}</button>`).join("")}
         </div>
         <span class="count-note" id="count-note"></span>
+        <a class="btn" href="/api/export/recommendations.csv" download
+          title="Download the full recommendation set as CSV">Export CSV</a>
       </div>
       <div class="card" style="padding: 6px 10px">
         <div id="products-table"></div>
@@ -610,6 +688,15 @@
       </div>
 
       <div class="card" style="margin-top: 24px">
+        <div class="section-title">Recommended price path</div>
+        <div class="section-note">Multi-period schedule over the remaining
+          shelf life — the optimizer weighs marking down now against
+          repricing later, so a discount is only scheduled when its timing
+          beats both holding and an immediate markdown.</div>
+        <div id="path-box"><div class="skeleton" style="height:200px"></div></div>
+      </div>
+
+      <div class="card" style="margin-top: 24px">
         <div class="section-title">Scenario: try a different price</div>
         <div class="section-note">Drag to any allowed price. The economics
           are evaluated live by the backend engine — nothing is estimated in
@@ -625,6 +712,120 @@
     drawBreakEven(document.getElementById("breakeven-box"), detail);
     drawPosition(document.getElementById("position-box"), detail);
     setupScenario(document.getElementById("scenario-box"), detail);
+    api(`/api/products/${id}/path`).then((path) => {
+      drawPathCard(document.getElementById("path-box"), path);
+    }).catch((err) => {
+      const box = document.getElementById("path-box");
+      if (box) {
+        box.innerHTML = `<div class="empty-note">Could not load the price
+          path: ${esc(err.message)}</div>`;
+      }
+    });
+  }
+
+  /* ---------- multi-period path ---------- */
+
+  function stepPoints(dailyPrices) {
+    /* Duplicate boundary x-values so the polyline renders as day steps. */
+    const pts = [];
+    dailyPrices.forEach((price, day) => {
+      pts.push({ x: day, y: price });
+      pts.push({ x: day + 1, y: price });
+    });
+    return pts;
+  }
+
+  function drawPathChart(box, path, extraSeries) {
+    const strategies = path.strategies;
+    const series = [];
+    if (strategies.hold) {
+      series.push({
+        points: stepPoints(strategies.hold.daily_prices),
+        color: Charts.COLORS.line, dash: "3 4", width: 1.5,
+      });
+    }
+    if (strategies.immediate) {
+      series.push({
+        points: stepPoints(strategies.immediate.daily_prices),
+        color: Charts.COLORS.warning, dash: "6 5", width: 1.5,
+      });
+    }
+    series.push({
+      points: stepPoints(path.daily_prices),
+      color: Charts.COLORS.accent, width: 2.5, area: true,
+    });
+    if (extraSeries) series.push(extraSeries);
+    Charts.lineChart(box, {
+      height: 230,
+      series,
+      xFormat: (v) => Number.isInteger(v) ? `Day ${v}` : "",
+      yFormat: (v) => "$" + v.toFixed(2),
+      ariaLabel: "Recommended price by day",
+    });
+  }
+
+  function pathStrategyTable(path) {
+    const strategies = path.strategies;
+    const rows = [
+      ["Revenue", "revenue", fmt.money],
+      ["Gross profit", "gross_profit", fmt.money],
+      ["Expected waste", "waste_units", (v) => fmt.units(v) + " units"],
+      ["Holding cost", "holding_cost", fmt.money],
+      ["Economic value", "economic_value", fmt.money],
+    ];
+    const cols = [
+      ["hold", "Hold throughout"],
+      ...(strategies.immediate
+        ? [["immediate",
+            `Immediate ${fmt.money(strategies.immediate.price)}`]] : []),
+      ["recommended", "Optimized path"],
+    ];
+    return `<div class="table-wrap"><table class="compare strategy-table">
+      <thead><tr><th>Metric</th>
+        ${cols.map(([key, label]) => `
+          <th class="num ${key === "recommended" ? "col-rec" : ""}">
+            ${label}</th>`).join("")}
+      </tr></thead>
+      <tbody>
+        ${rows.map(([label, key, format]) => `
+          <tr><td>${label}</td>
+            ${cols.map(([ckey]) => `
+              <td class="num ${ckey === "recommended" ? "col-rec" : ""}">
+                ${format(strategies[ckey].econ[key])}</td>`).join("")}
+          </tr>`).join("")}
+      </tbody></table></div>`;
+  }
+
+  function drawPathCard(box, path) {
+    if (!box) return;
+    const scheduleText = path.schedule.map((seg, i) => {
+      const start = path.schedule.slice(0, i)
+        .reduce((acc, s) => acc + s.days, 0);
+      return `<span class="chip ${i === path.schedule.length - 1
+        && path.schedule.length > 1 ? "markdown" : "hold"}">
+        Day ${start}${seg.days > 1 ? `–${start + seg.days - 1}` : ""}:
+        ${fmt.money(seg.price)}</span>`;
+    }).join(" ");
+
+    box.innerHTML = `
+      <div style="margin-bottom: 10px">${scheduleText}</div>
+      <div id="path-chart"></div>
+      <div class="chart-legend">
+        <span class="key"><span class="swatch" style="background:#7C5CFF"></span>optimized path</span>
+        <span class="key"><span class="swatch" style="background:#8B8B94"></span>hold</span>
+        ${path.strategies.immediate
+          ? `<span class="key"><span class="swatch" style="background:#D6A84F"></span>immediate markdown</span>`
+          : ""}
+      </div>
+      <div style="margin-top: 16px">${pathStrategyTable(path)}</div>
+      ${path.action !== "Hold" ? `
+        <ul class="reason-list" style="margin-top: 14px">
+          ${path.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}
+        </ul>` : `
+        <div class="section-note" style="margin: 14px 0 0">
+          ${esc(path.reasons[0] || "No staged markdown beats holding.")}
+        </div>`}`;
+    drawPathChart(document.getElementById("path-chart"), path);
   }
 
   function drawDemandCurve(box, sweep, detail) {
@@ -796,6 +997,25 @@
         <span class="v">${fmt.num(inv.expiry_pressure, 2)}</span></div>
       <div class="impact-row"><span class="k">Unit cost</span>
         <span class="v">${fmt.money(detail.pricing.unit_cost)}</span></div>`;
+    if (detail.provenance) {
+      const prov = detail.provenance;
+      const elasticity = prov.elasticity_source === "estimated"
+        ? `<span class="estimated">estimated</span> from
+           ${fmt.num(prov.elasticity_n_obs)} observed transactions`
+        : `<span class="fallback">fallback assumption</span> —
+           ${esc(prov.elasticity_reason || "not learned from your data")}`;
+      const baseline = prov.baseline_source === "history"
+        ? `from ${fmt.num(prov.baseline_n_days)} recent day(s) of this
+           product's sales history`
+        : `<span class="fallback">fallback</span> — no sales history for
+           this product, using the ${prov.baseline_source === "category"
+             ? "category median" : "dataset median"} rate`;
+      box.innerHTML += `
+        <div class="prov-note">
+          Elasticity ${fmt.num(detail.demand.elasticity, 2)}: ${elasticity}.
+          <br>Baseline demand: ${baseline}.
+        </div>`;
+    }
   }
 
   /* ---------- scenario ---------- */
@@ -896,7 +1116,7 @@
 
   /* ---------- pricing (scenario lab) ---------- */
 
-  const pricingState = { selected: null, query: "" };
+  const pricingState = { selected: null, query: "", mode: "single" };
 
   async function renderPricing() {
     const payload = await api("/api/products");
@@ -908,9 +1128,19 @@
     }
     view.innerHTML = `
       <h1 class="page-title">Pricing</h1>
-      <p class="page-subtitle">Explore what any allowed price would do to a
-      product's economics. Every evaluation runs in the backend pricing
-      engine.</p>
+      <p class="page-subtitle">Explore what any allowed price — or an entire
+      multi-day price path — would do to a product's economics. Every
+      evaluation runs in the backend pricing engine.</p>
+      <div class="toolbar" style="margin-bottom: 18px">
+        <div class="mode-toggle" role="group" aria-label="Scenario mode">
+          <button data-mode="single"
+            class="${pricingState.mode === "single" ? "active" : ""}">
+            Single price</button>
+          <button data-mode="path"
+            class="${pricingState.mode === "path" ? "active" : ""}">
+            Price path</button>
+        </div>
+      </div>
       <div class="detail-grid" style="grid-template-columns: minmax(0,4fr) minmax(0,8fr)">
         <div class="card" style="padding: 14px">
           <input class="search" id="picker-search" type="search"
@@ -925,7 +1155,7 @@
             <div id="lab-curve"></div>
           </div>
           <div class="card">
-            <div class="section-title">Scenario</div>
+            <div class="section-title" id="lab-scenario-title">Scenario</div>
             <div id="lab-scenario"></div>
           </div>
         </div>
@@ -935,6 +1165,15 @@
     searchBox.addEventListener("input", () => {
       pricingState.query = searchBox.value;
       drawPicker(products);
+    });
+    view.querySelectorAll(".mode-toggle button").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        if (pricingState.mode === btn.dataset.mode) return;
+        pricingState.mode = btn.dataset.mode;
+        view.querySelectorAll(".mode-toggle button").forEach((b) =>
+          b.classList.toggle("active", b === btn));
+        await drawLab(products);
+      });
     });
     drawPicker(products);
     await drawLab(products);
@@ -970,12 +1209,17 @@
   }
 
   async function drawLab(products) {
+    if (pricingState.mode === "path") {
+      await drawPathLab(products);
+      return;
+    }
     const summary = products.find((p) => p.id === pricingState.selected);
     const [detail, sweep] = await Promise.all([
       api(`/api/products/${pricingState.selected}`),
       api(`/api/products/${pricingState.selected}/sweep`),
     ]);
     document.getElementById("lab-title").textContent = summary.name;
+    document.getElementById("lab-scenario-title").textContent = "Scenario";
     document.getElementById("lab-note").textContent =
       detail.action === "markdown"
         ? `Recommended ${fmt.money(detail.pricing.recommended)} `
@@ -985,6 +1229,129 @@
           + "allowed price improves on it.";
     drawValueCurve(document.getElementById("lab-curve"), sweep);
     setupScenario(document.getElementById("lab-scenario"), detail);
+  }
+
+  async function drawPathLab(products) {
+    const summary = products.find((p) => p.id === pricingState.selected);
+    const path = await api(`/api/products/${pricingState.selected}/path`);
+    document.getElementById("lab-title").textContent =
+      `${summary.name} — recommended path`;
+    document.getElementById("lab-note").textContent =
+      path.action === "Hold"
+        ? "The optimizer keeps the current price for the whole horizon — "
+          + "no staged markdown beats holding."
+        : `${path.action} over ${path.horizon_days} day(s), worth `
+          + `${fmt.signedMoney(path.improvement_vs_hold)} vs holding. `
+          + "Edit the day prices below to test your own schedule.";
+    const curveBox = document.getElementById("lab-curve");
+    drawPathChart(curveBox, path);
+    curveBox.insertAdjacentHTML("beforeend", pathStrategyTable(path));
+    document.getElementById("lab-scenario-title").textContent =
+      "Your own price path";
+    setupPathScenario(
+      document.getElementById("lab-scenario"), summary, path);
+  }
+
+  function setupPathScenario(box, summary, path) {
+    const floor = path.constraints.floor;
+    const ceiling = path.constraints.ceiling;
+    box.innerHTML = `
+      <div class="section-note" style="margin-bottom: 4px">
+        Set a price per day (allowed ${fmt.money(floor)} –
+        ${fmt.money(ceiling)}, drops of at most
+        ${fmt.pct(path.constraints.max_daily_drop_pct, 0)} per day, no
+        increases). The whole path is valued by the backend engine.</div>
+      <div class="path-days" id="path-day-inputs">
+        ${path.daily_prices.map((price, day) => `
+          <div class="path-day">
+            <label for="pd-${day}">Day ${day}</label>
+            <input id="pd-${day}" type="number" step="0.01"
+              min="${floor.toFixed(2)}" max="${ceiling.toFixed(2)}"
+              value="${price.toFixed(2)}" data-day="${day}"
+              inputmode="decimal">
+          </div>`).join("")}
+      </div>
+      <div class="path-errors" id="path-errors"></div>
+      <div id="path-scenario-result"></div>`;
+
+    const inputs = Array.from(
+      box.querySelectorAll("#path-day-inputs input"));
+    const errorsBox = document.getElementById("path-errors");
+    const resultBox = document.getElementById("path-scenario-result");
+    let timer = null;
+    let requestId = 0;
+
+    async function evaluate() {
+      const prices = inputs.map((input) => parseFloat(input.value));
+      if (prices.some((p) => !isFinite(p))) {
+        errorsBox.innerHTML = "<div>Every day needs a numeric price.</div>";
+        return;
+      }
+      inputs.forEach((input, day) => input.classList.toggle(
+        "changed",
+        Math.abs(prices[day] - path.daily_prices[day]) > 0.005));
+      const id = ++requestId;
+      try {
+        const result = await apiPost(
+          `/api/products/${summary.id}/path/scenario`,
+          { daily_prices: prices });
+        if (id !== requestId) return;
+        if (result.errors && result.errors.length) {
+          errorsBox.innerHTML = result.errors.map(
+            (e) => `<div>${esc(e)}</div>`).join("");
+          resultBox.innerHTML = "";
+          return;
+        }
+        errorsBox.innerHTML = "";
+        const yours = result.econ;
+        const rows = [
+          ["Revenue", "revenue", fmt.money],
+          ["Gross profit", "gross_profit", fmt.money],
+          ["Expected waste", "waste_units", (v) => fmt.units(v) + " units"],
+          ["Economic value", "economic_value", fmt.money],
+        ];
+        const cols = [
+          ["Hold", result.compare.hold],
+          ["Your path", yours],
+          ["Optimized", result.compare.recommended],
+        ];
+        const delta = yours.economic_value
+          - result.compare.recommended.economic_value;
+        resultBox.innerHTML = `<div class="table-wrap">
+          <table class="compare strategy-table">
+          <thead><tr><th>Metric</th>
+            ${cols.map(([label], i) => `
+              <th class="num ${i === 1 ? "col-rec" : ""}">${label}</th>`)
+              .join("")}
+          </tr></thead>
+          <tbody>${rows.map(([label, key, format]) => `
+            <tr><td>${label}</td>
+              ${cols.map(([, econ], i) => `
+                <td class="num ${i === 1 ? "col-rec" : ""}">
+                  ${format(econ[key])}</td>`).join("")}
+            </tr>`).join("")}
+          </tbody></table></div>
+          <div class="section-note" style="margin-top: 12px">
+            ${Math.abs(delta) <= 0.01
+              ? "Your path matches the optimizer's expected value."
+              : delta > 0
+                ? "Your path beats the optimizer's restricted schedule "
+                  + `by <span class="delta-pos">${fmt.signedMoney(delta)}</span>.`
+                : `Your path gives up <span class="delta-warn">
+                   ${fmt.money(Math.abs(delta))}</span> vs the optimized
+                   schedule.`}
+          </div>`;
+      } catch (err) {
+        if (id !== requestId) return;
+        errorsBox.innerHTML = `<div>${esc(err.message)}</div>`;
+      }
+    }
+
+    inputs.forEach((input) => input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(evaluate, 280);
+    }));
+    evaluate();
   }
 
   /* ---------- analytics ---------- */
@@ -1046,12 +1413,24 @@
         </div>
       </div>
 
+      <div class="card" style="margin-top: 24px" id="path-backtest-card">
+        <div class="section-title">Multi-period strategy backtest</div>
+        <div class="section-note">Hold vs immediate markdown vs the
+          optimized multi-day path, replayed against the simulator's ground
+          truth with identical demand noise. Synthetic simulation only —
+          not real-world performance.</div>
+        <div id="path-backtest-box"></div>
+      </div>
+
       <div class="card" style="margin-top: 24px">
         <div class="section-title">Price changes</div>
         <div class="section-note">Current → recommended for every
           repriced product.</div>
         <div id="dumbbell-chart"></div>
       </div>`;
+
+    drawPathBacktest(
+      document.getElementById("path-backtest-box"), data.path_backtest);
 
     Charts.barChart(document.getElementById("depth-chart"), {
       items: Object.entries(data.markdowns.depth_distribution).map(
@@ -1114,6 +1493,397 @@
     }
   }
 
+  function drawPathBacktest(box, backtest) {
+    if (!backtest) {
+      box.innerHTML = `<div class="empty-note">The strategy backtest needs
+        the synthetic simulator's ground truth, which does not exist for
+        imported data.</div>`;
+      return;
+    }
+    const rows = [
+      ["Revenue", "revenue", fmt.money],
+      ["Gross profit", "gross_profit", fmt.money],
+      ["Units sold", "units_sold", fmt.units],
+      ["Waste units", "waste_units", fmt.units],
+      ["Sell-through", "sell_through", (v) => fmt.pct(100 * v, 0)],
+      ["Economic value", "economic_value", fmt.money],
+    ];
+    const cols = [
+      ["hold", "Hold"], ["immediate", "Immediate markdown"],
+      ["path", "Optimized path"],
+    ];
+    box.innerHTML = `<div class="table-wrap">
+      <table class="compare strategy-table">
+      <thead><tr><th>Metric</th>
+        ${cols.map(([key, label]) => `
+          <th class="num ${key === "path" ? "col-rec" : ""}">${label}</th>`)
+          .join("")}
+      </tr></thead>
+      <tbody>${rows.map(([label, key, format]) => `
+        <tr><td>${label}</td>
+          ${cols.map(([ckey]) => `
+            <td class="num ${ckey === "path" ? "col-rec" : ""}">
+              ${format(backtest[ckey][key])}</td>`).join("")}
+        </tr>`).join("")}
+      </tbody></table></div>
+      <div class="section-note" style="margin-top: 10px">
+        ${fmt.num(backtest.n_products)} products,
+        ${fmt.num(backtest.n_staged_paths)} with staged (hold-first)
+        schedules. Identical noise for all three strategies.</div>`;
+  }
+
+  /* ---------- data page ---------- */
+
+  const dataState = {
+    uploads: { products: null, transactions: null },
+    mappings: { products: {}, transactions: {} },
+    validation: null,
+    busy: false,
+  };
+
+  function mappingFromSuggestions(payload) {
+    const mapping = {};
+    for (const [fieldName, s] of Object.entries(
+      payload.suggested_mapping || {})) {
+      mapping[fieldName] = s.column;
+    }
+    return mapping;
+  }
+
+  async function renderData() {
+    const status = await api("/api/data/status", { fresh: true });
+    const custom = status.custom;
+    view.innerHTML = `
+      <h1 class="page-title">Data</h1>
+      <p class="page-subtitle">Run Self-Shelf on your own retail data.
+      Upload a product snapshot and daily sales history, map the columns,
+      review validation, and import. Nothing is used until you import, and
+      imported files stay on this machine.</p>
+
+      <div class="card">
+        <div class="section-title">Data source</div>
+        <div class="section-note">Synthetic simulation and imported data are
+          kept fully separate — switch between them at any time.</div>
+        <div class="mode-toggle" role="group" aria-label="Data source">
+          <button data-source="synthetic"
+            class="${status.active_source === "synthetic" ? "active" : ""}">
+            Synthetic demo</button>
+          <button data-source="custom"
+            class="${status.active_source === "custom" ? "active" : ""}"
+            ${custom.available ? "" : "disabled"}>
+            Custom data${custom.available ? "" : " (none imported)"}</button>
+        </div>
+        <div id="custom-summary" style="margin-top: 18px"></div>
+      </div>
+
+      <div class="card" style="margin-top: 24px">
+        <div class="section-title">1 — Upload files</div>
+        <div class="section-note">CSV files. Products: one row per product
+          (id, name, price, cost, inventory, days to expiry). Transactions:
+          one row per product per day (date, product id, price, units sold)
+          — required, because demand is estimated from observed sales, and
+          days missing from the history count as zero-sale days.</div>
+        <div class="upload-grid">
+          ${["products", "transactions"].map((kind) => `
+            <div class="upload-box">
+              <h4>${kind === "products" ? "Products (current shelf)"
+                : "Transactions (sales history)"}</h4>
+              <div class="hint">${kind === "products"
+                ? "product_id, product_name, category, current_price, cost, inventory, days_to_expiry, …"
+                : "date, product_id, price, units_sold, …"}</div>
+              <input type="file" accept=".csv,text/csv" data-kind="${kind}"
+                aria-label="Upload ${kind} CSV">
+              <div class="file-ok" id="upload-ok-${kind}"></div>
+            </div>`).join("")}
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 24px" id="mapping-card">
+        <div class="section-title">2 — Map columns</div>
+        <div class="section-note">Match your CSV columns to Self-Shelf
+          fields. Suggestions are pre-filled from the headers; correct any
+          that are wrong.</div>
+        <div id="mapping-box"><div class="empty-note">Upload both files to
+          map their columns.</div></div>
+      </div>
+
+      <div class="card" style="margin-top: 24px" id="validate-card">
+        <div class="section-title">3 — Validate &amp; import</div>
+        <div class="section-note">Rows that fail validation are rejected
+          with a reason and can be downloaded — they are never silently
+          dropped.</div>
+        <div style="display:flex; gap: 12px; margin-bottom: 8px">
+          <button class="btn" id="validate-btn" disabled>Validate</button>
+          <button class="btn btn-accent" id="import-btn" disabled>
+            Import &amp; optimize</button>
+        </div>
+        <div id="validation-box"></div>
+      </div>
+
+      <div class="card" style="margin-top: 24px">
+        <div class="section-title">Export</div>
+        <div class="section-note">Download the current recommendation set
+          (active source: ${esc(status.active_source)}).</div>
+        <div style="display:flex; gap: 12px; flex-wrap: wrap">
+          <a class="btn" href="/api/export/recommendations.csv" download>
+            Recommendations CSV</a>
+          <a class="btn" href="/api/export/paths.csv" download>
+            Price paths CSV</a>
+        </div>
+      </div>`;
+
+    drawCustomSummary(document.getElementById("custom-summary"), custom);
+
+    view.querySelectorAll(".mode-toggle button[data-source]").forEach(
+      (btn) => {
+        btn.addEventListener("click", async () => {
+          if (btn.disabled || dataState.busy) return;
+          try {
+            dataState.busy = true;
+            await apiPost("/api/data/source",
+              { source: btn.dataset.source });
+            clearCache();
+            await refreshMode();
+            route();
+          } catch (err) {
+            alertBox(`Could not switch source: ${err.message}`);
+          } finally {
+            dataState.busy = false;
+          }
+        });
+      });
+
+    view.querySelectorAll("input[type=file][data-kind]").forEach((input) => {
+      input.addEventListener("change", async () => {
+        const kind = input.dataset.kind;
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const okBox = document.getElementById(`upload-ok-${kind}`);
+        okBox.textContent = "Uploading…";
+        try {
+          const payload = await apiUpload(
+            `/api/data/upload?kind=${kind}`, file);
+          dataState.uploads[kind] = payload;
+          dataState.mappings[kind] = mappingFromSuggestions(payload);
+          dataState.validation = null;
+          okBox.textContent = `${payload.filename} — `
+            + `${fmt.num(payload.row_count)} rows, `
+            + `${payload.columns.length} columns`;
+          drawMapping();
+          syncDataButtons();
+        } catch (err) {
+          okBox.textContent = "";
+          alertBox(`Upload failed: ${err.message}`);
+        }
+      });
+    });
+
+    document.getElementById("validate-btn").addEventListener(
+      "click", () => runValidation(false));
+    document.getElementById("import-btn").addEventListener(
+      "click", () => runValidation(true));
+
+    drawMapping();
+    syncDataButtons();
+  }
+
+  function alertBox(message) {
+    const box = document.getElementById("validation-box");
+    if (box) {
+      box.innerHTML = `<div class="path-errors"><div>${esc(message)}</div></div>`
+        + box.innerHTML;
+    }
+  }
+
+  function drawCustomSummary(box, custom) {
+    if (!custom.available || !custom.meta) {
+      box.innerHTML = `<div class="section-note" style="margin:0">
+        No custom dataset imported yet. The dashboard is running on the
+        synthetic demo simulation.</div>`;
+      if (custom.error) {
+        box.innerHTML += `<div class="path-errors">
+          <div>${esc(custom.error)}</div></div>`;
+      }
+      return;
+    }
+    const meta = custom.meta;
+    const q = meta.quality || {};
+    const range = q.date_range
+      ? `${q.date_range.start} → ${q.date_range.end}` : "—";
+    box.innerHTML = `
+      <div class="quality-grid">
+        <div class="quality-cell"><div class="n">${fmt.num(q.products)}</div>
+          <div class="l">products</div></div>
+        <div class="quality-cell"><div class="n">${fmt.num(q.transactions)}</div>
+          <div class="l">transactions</div></div>
+        <div class="quality-cell"><div class="n">${fmt.num(q.products_with_history)}</div>
+          <div class="l">with sales history</div></div>
+        <div class="quality-cell"><div class="n">${fmt.num(q.products_without_history)}</div>
+          <div class="l">using fallback demand</div></div>
+        <div class="quality-cell"><div class="n" style="font-size:13px; margin-top:4px">${range}</div>
+          <div class="l">history range</div></div>
+      </div>
+      <div class="section-note" style="margin: 14px 0 0">
+        Imported ${meta.imported_at
+          ? new Date(meta.imported_at).toLocaleString() : "—"} ·
+        elasticities by category:</div>
+      <ul class="issue-list">
+        ${Object.entries(meta.elasticities || {}).map(([cat, e]) => `
+          <li class="${e.source === "estimated" ? "ok" : ""}">
+            <strong>${esc(cat)}</strong>: ${fmt.num(e.elasticity, 2)}
+            — ${e.source === "estimated"
+              ? `estimated from ${fmt.num(e.n_observations)} observations`
+              : `fallback (${esc(e.reason || "insufficient data")})`}
+          </li>`).join("")}
+      </ul>`;
+  }
+
+  function drawMapping() {
+    const box = document.getElementById("mapping-box");
+    if (!box) return;
+    const kinds = ["products", "transactions"];
+    if (!kinds.every((k) => dataState.uploads[k])) {
+      box.innerHTML = `<div class="empty-note">Upload both files to map
+        their columns.</div>`;
+      return;
+    }
+    box.innerHTML = kinds.map((kind) => {
+      const upload = dataState.uploads[kind];
+      const fields = [
+        ...upload.required_fields.map((f) => [f, true]),
+        ...upload.optional_fields.map((f) => [f, false]),
+      ];
+      return `
+        <div style="margin-top: 8px">
+          <h4 style="font-size:13.5px; margin-bottom: 2px">
+            ${kind === "products" ? "Products file" : "Transactions file"}
+            <span class="map-conf">(${esc(upload.filename)})</span></h4>
+          <div class="map-grid">
+            ${fields.map(([fieldName, required]) => {
+              const chosen = dataState.mappings[kind][fieldName] || "";
+              const suggestion = (upload.suggested_mapping || {})[fieldName];
+              return `
+                <span class="fname">${fieldName}
+                  ${required ? '<span class="req">*</span>' : ""}</span>
+                <select class="select" data-kind="${kind}"
+                  data-field="${fieldName}"
+                  aria-label="${kind} column for ${fieldName}">
+                  <option value="">— not in file —</option>
+                  ${upload.columns.map((c) => `
+                    <option value="${esc(c)}"
+                      ${c === chosen ? "selected" : ""}>${esc(c)}</option>`)
+                    .join("")}
+                </select>
+                <span class="map-conf ${suggestion
+                  && suggestion.column === chosen
+                  && suggestion.confidence === "exact" ? "exact" : ""}">
+                  ${suggestion && suggestion.column === chosen
+                    ? suggestion.confidence + " match" : ""}</span>`;
+            }).join("")}
+          </div>
+        </div>`;
+    }).join("");
+
+    box.querySelectorAll("select[data-kind]").forEach((select) => {
+      select.addEventListener("change", () => {
+        const kind = select.dataset.kind;
+        if (select.value) {
+          dataState.mappings[kind][select.dataset.field] = select.value;
+        } else {
+          delete dataState.mappings[kind][select.dataset.field];
+        }
+        dataState.validation = null;
+        syncDataButtons();
+      });
+    });
+  }
+
+  function syncDataButtons() {
+    const validateBtn = document.getElementById("validate-btn");
+    const importBtn = document.getElementById("import-btn");
+    if (!validateBtn) return;
+    const uploaded = dataState.uploads.products
+      && dataState.uploads.transactions;
+    validateBtn.disabled = !uploaded || dataState.busy;
+    importBtn.disabled = !uploaded || dataState.busy
+      || !(dataState.validation && dataState.validation.can_import);
+  }
+
+  async function runValidation(thenImport) {
+    const box = document.getElementById("validation-box");
+    dataState.busy = true;
+    syncDataButtons();
+    box.innerHTML = `<div class="section-note">Validating…</div>`;
+    try {
+      const payload = {
+        products_mapping: dataState.mappings.products,
+        transactions_mapping: dataState.mappings.transactions,
+      };
+      const report = await apiPost("/api/data/validate", payload);
+      dataState.validation = report;
+      drawValidationReport(box, report);
+      if (thenImport && report.can_import) {
+        box.insertAdjacentHTML("afterbegin",
+          `<div class="section-note">Importing and optimizing…</div>`);
+        const result = await apiPost("/api/data/import", payload);
+        clearCache();
+        await refreshMode();
+        dataState.validation = null;
+        route();
+        return;
+      }
+    } catch (err) {
+      box.innerHTML = `<div class="path-errors">
+        <div>${esc(err.message)}</div></div>`;
+    } finally {
+      dataState.busy = false;
+      syncDataButtons();
+    }
+  }
+
+  function drawValidationReport(box, report) {
+    const section = (kind, r) => {
+      const issues = (r.issues || []).map(
+        (i) => `<li>${esc(i.message)}</li>`).join("");
+      const errors = (r.errors || []).map(
+        (e) => `<li class="err">${esc(e)}</li>`).join("");
+      const warnings = (r.warnings || []).map(
+        (w) => `<li>${esc(w)}</li>`).join("");
+      const preview = (r.preview && r.preview.length)
+        ? `<div class="table-wrap" style="margin-top:10px"><table>
+            <thead><tr>${Object.keys(r.preview[0]).map(
+              (c) => `<th>${esc(c)}</th>`).join("")}</tr></thead>
+            <tbody>${r.preview.map((row) => `<tr>${Object.values(row).map(
+              (v) => `<td>${esc(v == null ? "—" : v)}</td>`).join("")}
+              </tr>`).join("")}</tbody>
+          </table></div>` : "";
+      return `
+        <div style="margin-top: 16px">
+          <h4 style="font-size: 13.5px">
+            ${kind === "products" ? "Products" : "Transactions"} —
+            <span class="${r.rows_rejected ? "delta-warn" : "delta-pos"}">
+              ${fmt.num(r.rows_valid)} valid</span> /
+            ${fmt.num(r.rows_total)} rows
+            ${r.rows_rejected
+              ? `· <a href="/api/data/rejected?kind=${kind}" download>
+                  download ${fmt.num(r.rows_rejected)} rejected</a>` : ""}
+          </h4>
+          ${errors ? `<ul class="issue-list">${errors}</ul>` : ""}
+          ${issues ? `<ul class="issue-list">${issues}</ul>` : ""}
+          ${warnings ? `<ul class="issue-list">${warnings}</ul>` : ""}
+          ${preview}
+        </div>`;
+    };
+    box.innerHTML = `
+      ${report.can_import
+        ? `<div class="section-note" style="color: var(--positive)">
+            Validation passed — ready to import.</div>`
+        : `<div class="path-errors"><div>Fix the highlighted problems
+            before importing.</div></div>`}
+      ${section("products", report.products)}
+      ${section("transactions", report.transactions)}`;
+  }
+
   /* ---------- router / boot ---------- */
 
   const routes = [
@@ -1122,6 +1892,7 @@
     { pattern: /^#\/products$/, nav: "products", render: renderProducts },
     { pattern: /^#\/pricing$/, nav: "pricing", render: renderPricing },
     { pattern: /^#\/analytics$/, nav: "analytics", render: renderAnalytics },
+    { pattern: /^#\/data$/, nav: "data", render: renderData },
     { pattern: /^#\/overview$|^$|^#\/?$/, nav: "overview",
       render: renderOverview },
   ];
@@ -1145,7 +1916,7 @@
   async function boot() {
     renderComputing();
     try {
-      const status = await api("/api/status", { fresh: true });
+      const status = await refreshMode();
       if (!status.ready) {
         if (status.error) {
           renderError(status.error, boot);

@@ -1,0 +1,15 @@
+.git/
+Code/
+Reports/
+research/
+output/
+tests/
+data/custom/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+.idea/
+*.pyc

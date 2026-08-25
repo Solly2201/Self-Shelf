@@ -1,0 +1,8 @@
+services:
+  selfshelf:
+    build: .
+    ports:
+      - "8765:8765"
+    volumes:
+      # Imported custom datasets survive container restarts.
+      - ./data/custom:/app/data/custom
