@@ -13,7 +13,7 @@ from .demand import (
     estimate_elasticities,
     simulate_demand,
 )
-from .economics import ProductContext, days_of_supply
+from .economics import ProductContext, days_of_supply, inventory_pressure
 from .evaluation import SplitData, evaluate_model, split_data
 from .features import clean_data, engineer_features, load_data
 from .optimizer import OptimizationResult, optimize_product, price_sweep
@@ -68,7 +68,7 @@ def _recommendation_row(
         "Department": row["DEPARTMENT"],
         "Unit_Cost": round(p.unit_cost, 2),
         "Current_Price": round(p.current_price, 2),
-        "Optimized_Price": round(result.optimized_price, 2),
+        "Recommended_Price": round(result.optimized_price, 2),
         "Markdown_Percentage": round(result.markdown_pct, 1),
         "Action": result.action,
         "Days_To_Expiry": int(p.days_to_expiry),
@@ -77,17 +77,37 @@ def _recommendation_row(
             round(dos, 1) if np.isfinite(dos) else "inf"
         ),
         "Elasticity": round(p.elasticity, 2),
+        "Expiry_Pressure": round(cur["expiry_pressure"], 3),
+        "Inventory_Pressure": round(
+            inventory_pressure(
+                p.inventory_units, cur["daily_demand"], p.days_to_expiry
+            ),
+            3,
+        ),
         "Predicted_Demand_Current": round(cur["daily_demand"], 2),
         "Predicted_Demand_Optimized": round(opt["daily_demand"], 2),
-        "Expected_Revenue": round(opt["expected_revenue"], 2),
-        "Expected_Profit": round(
-            opt["expected_revenue"] - opt["cogs"], 2
+        "Expected_Units_Sold_Current": round(cur["expected_sales_units"], 2),
+        "Expected_Units_Sold_Optimized": round(opt["expected_sales_units"], 2),
+        "Sell_Through_Current": round(cur["expected_sell_through"], 3),
+        "Sell_Through_Optimized": round(opt["expected_sell_through"], 3),
+        "Gross_Revenue_Current": round(cur["expected_revenue"], 2),
+        "Gross_Revenue_Optimized": round(opt["expected_revenue"], 2),
+        "Gross_Profit_Current": round(cur["gross_profit"], 2),
+        "Gross_Profit_Optimized": round(opt["gross_profit"], 2),
+        "Expected_Waste_Current": round(cur["expected_waste_units"], 2),
+        "Expected_Waste_Optimized": round(opt["expected_waste_units"], 2),
+        "Holding_Cost_Current": round(cur["holding_cost"], 2),
+        "Holding_Cost_Optimized": round(opt["holding_cost"], 2),
+        "Terminal_Inventory_Current": round(cur["terminal_inventory"], 2),
+        "Terminal_Inventory_Optimized": round(opt["terminal_inventory"], 2),
+        "Economic_Value_Current": round(cur["score"], 2),
+        "Economic_Value_Optimized": round(opt["score"], 2),
+        "Economic_Value_Improvement": round(result.value_improvement, 2),
+        "Break_Even_Unit_Uplift": (
+            round(result.break_even_uplift, 2)
+            if np.isfinite(result.break_even_uplift) else "inf"
         ),
-        "Expected_Waste_Units": round(opt["expected_waste_units"], 2),
-        "Expected_Waste_Units_At_Current_Price": round(
-            cur["expected_waste_units"], 2
-        ),
-        "Expiry_Pressure": round(cur["expiry_pressure"], 3),
+        "Predicted_Unit_Uplift": round(result.predicted_uplift, 2),
         "Economic_Reason": "; ".join(result.reasons),
     }
 

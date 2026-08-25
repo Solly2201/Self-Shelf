@@ -34,21 +34,39 @@ class TestPipeline:
     def test_output_columns(self, result):
         expected = {
             "SKU", "Product_Name", "Department", "Unit_Cost",
-            "Current_Price", "Optimized_Price", "Markdown_Percentage",
+            "Current_Price", "Recommended_Price", "Markdown_Percentage",
             "Action", "Days_To_Expiry", "Inventory_Units", "Days_Of_Supply",
-            "Elasticity", "Predicted_Demand_Current",
-            "Predicted_Demand_Optimized", "Expected_Revenue",
-            "Expected_Profit", "Expected_Waste_Units",
-            "Expected_Waste_Units_At_Current_Price", "Expiry_Pressure",
-            "Economic_Reason",
+            "Elasticity", "Expiry_Pressure", "Inventory_Pressure",
+            "Predicted_Demand_Current", "Predicted_Demand_Optimized",
+            "Expected_Units_Sold_Current", "Expected_Units_Sold_Optimized",
+            "Sell_Through_Current", "Sell_Through_Optimized",
+            "Gross_Revenue_Current", "Gross_Revenue_Optimized",
+            "Gross_Profit_Current", "Gross_Profit_Optimized",
+            "Expected_Waste_Current", "Expected_Waste_Optimized",
+            "Holding_Cost_Current", "Holding_Cost_Optimized",
+            "Terminal_Inventory_Current", "Terminal_Inventory_Optimized",
+            "Economic_Value_Current", "Economic_Value_Optimized",
+            "Economic_Value_Improvement", "Break_Even_Unit_Uplift",
+            "Predicted_Unit_Uplift", "Economic_Reason",
         }
         assert expected <= set(result.recommendations.columns)
 
     def test_prices_respect_business_rules(self, result):
         df = result.recommendations
-        assert (df["Optimized_Price"] > 0).all()
-        assert (df["Optimized_Price"] <= df["Current_Price"] + 1e-9).all()
-        assert (df["Expected_Waste_Units"] >= 0).all()
+        assert (df["Recommended_Price"] > 0).all()
+        assert (df["Recommended_Price"] <= df["Current_Price"] + 1e-9).all()
+        assert (df["Expected_Waste_Optimized"] >= 0).all()
+        assert (df["Sell_Through_Optimized"] <= 1.0 + 1e-9).all()
+        assert (df["Terminal_Inventory_Optimized"] >= -1e-9).all()
+        # A recommended markdown must never lower the expected economic
+        # value versus keeping the current price.
+        assert (df["Economic_Value_Improvement"] >= -1e-9).all()
+        # Sell-through can never fall when the price is reduced.
+        marked = df[df["Action"] == "Markdown"]
+        assert (
+            marked["Sell_Through_Optimized"]
+            >= marked["Sell_Through_Current"] - 1e-9
+        ).all()
 
     def test_model_report_has_leak_free_splits(self, result):
         assert set(result.model_report) == {"validation", "test"}

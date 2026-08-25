@@ -10,6 +10,8 @@ from .config import PricingConfig
 from .economics import (
     EconomicObjective,
     ProductContext,
+    break_even_unit_uplift,
+    compare_markdown_timing,
     days_of_supply,
     price_bounds,
 )
@@ -25,12 +27,23 @@ class OptimizationResult:
     optimized: Dict[str, float]  # objective breakdown at the optimized price
     bounds: tuple
     reasons: List[str] = field(default_factory=list)
+    # Gross-profit break-even sanity check: unit-sales multiplier the
+    # markdown needs vs the multiplier the demand model predicts.
+    break_even_uplift: float = 1.0
+    predicted_uplift: float = 1.0
+    # Simplified "act now vs wait" comparison (None when not applicable).
+    timing: Dict[str, float] = None
 
     @property
     def markdown_pct(self) -> float:
         return 100.0 * (
             1.0 - self.optimized_price / self.product.current_price
         )
+
+    @property
+    def value_improvement(self) -> float:
+        """Economic score gained by moving off the current price."""
+        return self.optimized["score"] - self.current["score"]
 
 
 def optimize_product(
@@ -97,6 +110,18 @@ def optimize_product(
         optimized=optimized_breakdown,
         bounds=bounds,
     )
+
+    if action == "Markdown":
+        result.break_even_uplift = break_even_unit_uplift(
+            current_price, best_price, product.unit_cost
+        )
+        if current_breakdown["daily_demand"] > 0:
+            result.predicted_uplift = (
+                optimized_breakdown["daily_demand"]
+                / current_breakdown["daily_demand"]
+            )
+        result.timing = compare_markdown_timing(product, config, best_price)
+
     result.reasons = _build_reasons(result, config)
     return result
 
@@ -133,6 +158,15 @@ def _build_reasons(result: OptimizationResult, config: PricingConfig) -> List[st
         )
 
     if result.action == "Markdown":
+        sell_through_delta = (
+            opt["expected_sell_through"] - cur["expected_sell_through"]
+        )
+        if sell_through_delta > 0.01:
+            reasons.append(
+                f"expected sell-through rises from "
+                f"{100 * cur['expected_sell_through']:.0f}% to "
+                f"{100 * opt['expected_sell_through']:.0f}%"
+            )
         waste_delta = cur["expected_waste_units"] - opt["expected_waste_units"]
         if waste_delta > 0.5:
             reasons.append(
@@ -146,10 +180,29 @@ def _build_reasons(result: OptimizationResult, config: PricingConfig) -> List[st
                 f"predicted daily demand rises from {cur['daily_demand']:.1f} "
                 f"to {opt['daily_demand']:.1f}"
             )
-        score_delta = opt["score"] - cur["score"]
+        if math.isfinite(result.break_even_uplift):
+            met = "meets" if (
+                result.predicted_uplift >= result.break_even_uplift
+            ) else "does not meet"
+            reasons.append(
+                f"gross-profit break-even needs {result.break_even_uplift:.2f}x "
+                f"unit volume; predicted uplift is {result.predicted_uplift:.2f}x "
+                f"({met} the hurdle on margin alone)"
+            )
+        else:
+            reasons.append(
+                "price is at or below cost: justified by avoiding waste/"
+                "terminal-stock losses, not by demand stimulation"
+            )
+        if result.timing and result.timing["advantage_now"] > 0.01:
+            reasons.append(
+                f"acting now rather than waiting "
+                f"{result.timing['wait_days']:.0f} day(s) preserves "
+                f"~${result.timing['advantage_now']:.2f} of expected value"
+            )
         reasons.append(
-            f"expected economic outcome improves by ${score_delta:.2f} over "
-            f"the evaluation window"
+            f"expected economic outcome improves by "
+            f"${result.value_improvement:.2f} over the evaluation window"
         )
     elif result.action == "Price Maintained":
         if cur["expected_waste_units"] <= 0.5:
@@ -184,11 +237,13 @@ def price_sweep(
         sweep.append({
             "price": round(b["price"], 2),
             "daily_demand": round(b["daily_demand"], 2),
+            "expected_units_sold": round(b["expected_sales_units"], 2),
+            "sell_through": round(b["expected_sell_through"], 3),
             "expected_revenue": round(b["expected_revenue"], 2),
-            "expected_profit": round(
-                b["expected_revenue"] - b["cogs"], 2
-            ),
+            "gross_profit": round(b["gross_profit"], 2),
             "expected_waste_units": round(b["expected_waste_units"], 2),
+            "terminal_inventory": round(b["terminal_inventory"], 2),
+            "holding_cost": round(b["holding_cost"], 2),
             "economic_score": round(b["score"], 2),
         })
     return sweep
