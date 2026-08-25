@@ -292,7 +292,7 @@ td {
 }
 
 td.cell-name {
-  max-width: 230px;
+  max-width: 205px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
