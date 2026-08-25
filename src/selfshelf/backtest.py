@@ -45,6 +45,7 @@ def _simulate_sell_down(
     remaining = float(row["INVENTORY_UNITS"])
     revenue = 0.0
     sold = 0.0
+    unit_days = 0.0
 
     for t in range(days):
         if remaining <= 0:
@@ -56,25 +57,32 @@ def _simulate_sell_down(
         sales = min(remaining, max(0.0, demand))
         revenue += price * sales
         sold += sales
+        # Midpoint approximation of stock carried through the day.
+        unit_days += remaining - sales / 2.0
         remaining -= sales
 
     cost = float(row["COST"])
     waste = remaining
     salvage = waste * config.waste.salvage_rate * cost
     inventory = float(row["INVENTORY_UNITS"])
+    holding_cost = config.inventory.holding_cost_per_unit_day * unit_days
+    # Gross profit net of losses on expired stock: sold units earn
+    # price - cost, expired units lose cost - salvage (plus disposal) —
+    # salvage enters here once, via unit_waste_loss.
+    gross_profit = revenue - cost * sold - waste * config.waste.unit_waste_loss(cost)
     return {
         "revenue": revenue,
         "units_sold": sold,
         "waste_units": waste,
+        # The episode runs to expiry, so terminal stock IS the waste; the
+        # field is kept separate so the accounting identity
+        # inventory = sold + terminal is explicit.
+        "terminal_inventory": remaining,
         "sell_through": sold / inventory if inventory > 0 else 1.0,
         "cash_recovered": revenue + salvage,
-        # Gross profit net of losses on expired stock: sold units earn
-        # price - cost, expired units lose cost - salvage (plus disposal).
-        "gross_profit": (
-            revenue
-            - cost * sold
-            - waste * config.waste.unit_waste_loss(cost)
-        ),
+        "holding_cost": holding_cost,
+        "gross_profit": gross_profit,
+        "economic_value": gross_profit - holding_cost,
     }
 
 
@@ -91,7 +99,9 @@ def backtest_recommendations(
     totals = {
         strategy: {
             "revenue": 0.0, "gross_profit": 0.0, "units_sold": 0.0,
-            "waste_units": 0.0, "cash_recovered": 0.0, "sell_through": 0.0,
+            "waste_units": 0.0, "terminal_inventory": 0.0,
+            "holding_cost": 0.0, "economic_value": 0.0,
+            "cash_recovered": 0.0, "sell_through": 0.0,
         }
         for strategy in ("hold", "recommended")
     }

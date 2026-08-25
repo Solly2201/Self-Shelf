@@ -115,11 +115,16 @@ def optimize_product(
         result.break_even_uplift = break_even_unit_uplift(
             current_price, best_price, product.unit_cost
         )
-        if current_breakdown["daily_demand"] > 0:
-            result.predicted_uplift = (
-                optimized_breakdown["daily_demand"]
-                / current_breakdown["daily_demand"]
-            )
+        # The hurdle is about units SOLD, not demand: when inventory caps
+        # sales at the lower price, the demand ratio would overstate the
+        # achievable uplift. With the sales ratio,
+        # uplift >= hurdle <=> gross profit improves, exactly.
+        sold_current = current_breakdown["expected_sales_units"]
+        sold_optimized = optimized_breakdown["expected_sales_units"]
+        if sold_current > 0:
+            result.predicted_uplift = sold_optimized / sold_current
+        elif sold_optimized > 0:
+            result.predicted_uplift = math.inf
         result.timing = compare_markdown_timing(product, config, best_price)
 
     result.reasons = _build_reasons(result, config)
@@ -184,9 +189,13 @@ def _build_reasons(result: OptimizationResult, config: PricingConfig) -> List[st
             met = "meets" if (
                 result.predicted_uplift >= result.break_even_uplift
             ) else "does not meet"
+            uplift_text = (
+                f"{result.predicted_uplift:.2f}x"
+                if math.isfinite(result.predicted_uplift) else "unbounded"
+            )
             reasons.append(
                 f"gross-profit break-even needs {result.break_even_uplift:.2f}x "
-                f"unit volume; predicted uplift is {result.predicted_uplift:.2f}x "
+                f"unit volume; predicted uplift is {uplift_text} "
                 f"({met} the hurdle on margin alone)"
             )
         else:

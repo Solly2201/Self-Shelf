@@ -109,7 +109,10 @@ def _recommendation_row(
             round(result.break_even_uplift, 2)
             if np.isfinite(result.break_even_uplift) else "inf"
         ),
-        "Predicted_Unit_Uplift": round(result.predicted_uplift, 2),
+        "Predicted_Unit_Uplift": (
+            round(result.predicted_uplift, 2)
+            if np.isfinite(result.predicted_uplift) else "inf"
+        ),
         "Economic_Reason": "; ".join(result.reasons),
     }
 

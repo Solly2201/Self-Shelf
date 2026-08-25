@@ -183,6 +183,8 @@ class ProductContext:
             raise ValueError("cost cannot be negative")
         if self.inventory_units < 0:
             raise ValueError("inventory cannot be negative")
+        if self.days_to_expiry < 0:
+            raise ValueError("days_to_expiry cannot be negative")
         if self.baseline_daily_demand < 0:
             raise ValueError("baseline demand cannot be negative")
 

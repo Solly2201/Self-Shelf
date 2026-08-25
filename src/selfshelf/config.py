@@ -192,7 +192,10 @@ class PricingConfig:
             "default_elasticity": self.elasticity.default,
             "expiry_tau_days": self.expiry.tau_days,
             "target_days_of_supply": self.inventory.target_days_of_supply,
+            "holding_cost_per_unit_day":
+                self.inventory.holding_cost_per_unit_day,
             "salvage_rate": self.waste.salvage_rate,
+            "disposal_cost_per_unit": self.waste.disposal_cost_per_unit,
             "min_margin": self.constraints.min_margin,
             "clearance_floor_cost_fraction":
                 self.constraints.clearance_floor_cost_fraction,

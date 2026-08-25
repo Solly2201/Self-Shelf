@@ -113,8 +113,11 @@ def main(argv=None) -> int:
         for key, label in (
             ("revenue", "revenue $"),
             ("gross_profit", "gross profit $"),
+            ("holding_cost", "holding cost $"),
+            ("economic_value", "econ. value $"),
             ("units_sold", "units sold"),
             ("waste_units", "waste units"),
+            ("terminal_inventory", "terminal units"),
             ("sell_through", "sell-through"),
             ("cash_recovered", "cash recov. $"),
         ):
