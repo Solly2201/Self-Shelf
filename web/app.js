@@ -684,6 +684,18 @@
             <div class="section-title">Inventory position</div>
             <div class="impact-rows" id="position-box"></div>
           </div>
+          <div class="card">
+            <div class="section-title">Elasticity confidence</div>
+            <div class="section-note">How well the price response is
+              identified by the data behind it.</div>
+            <div class="impact-rows" id="confidence-box"></div>
+          </div>
+          <div class="card">
+            <div class="section-title">Replenishment</div>
+            <div class="section-note">Known future deliveries feeding the
+              multi-period plan.</div>
+            <div class="impact-rows" id="replenishment-box"></div>
+          </div>
         </div>
       </div>
 
@@ -694,6 +706,16 @@
           repricing later, so a discount is only scheduled when its timing
           beats both holding and an immediate markdown.</div>
         <div id="path-box"><div class="skeleton" style="height:200px"></div></div>
+      </div>
+
+      <div class="card" style="margin-top: 24px">
+        <div class="section-title">Closed-loop re-optimization</div>
+        <div class="section-note">The daily adaptive loop: act today's
+          planned price, observe actual sales, update inventory and the
+          demand belief, re-optimize the remaining path. Choose how real
+          demand behaves relative to the forecast — this is a synthetic
+          what-if simulation, not observed sales.</div>
+        <div id="adaptive-box"></div>
       </div>
 
       <div class="card" style="margin-top: 24px">
@@ -711,6 +733,10 @@
     drawImpact(document.getElementById("impact-box"), detail);
     drawBreakEven(document.getElementById("breakeven-box"), detail);
     drawPosition(document.getElementById("position-box"), detail);
+    drawConfidenceCard(document.getElementById("confidence-box"), detail);
+    drawReplenishmentCard(
+      document.getElementById("replenishment-box"), detail.replenishment);
+    setupAdaptiveCard(document.getElementById("adaptive-box"), detail);
     setupScenario(document.getElementById("scenario-box"), detail);
     api(`/api/products/${id}/path`).then((path) => {
       drawPathCard(document.getElementById("path-box"), path);
@@ -807,8 +833,16 @@
         ${fmt.money(seg.price)}</span>`;
     }).join(" ");
 
+    const deliveries = path.replenishment
+      && path.replenishment.status === "known"
+      ? `<div style="margin: 0 0 10px">
+          ${path.replenishment.arrivals.map((a) => `<span class="chip hold">
+            Day ${a.day}: +${fmt.units(a.units)} units arriving</span>`)
+            .join(" ")}
+        </div>` : "";
     box.innerHTML = `
       <div style="margin-bottom: 10px">${scheduleText}</div>
+      ${deliveries}
       <div id="path-chart"></div>
       <div class="chart-legend">
         <span class="key"><span class="swatch" style="background:#7C5CFF"></span>optimized path</span>
@@ -1016,6 +1050,236 @@
           <br>Baseline demand: ${baseline}.
         </div>`;
     }
+  }
+
+  /* ---------- adaptive layer (V1.1) ---------- */
+
+  function confidenceChip(level) {
+    const labels = {
+      high: "High", medium: "Medium", low: "Low", fallback: "Fallback",
+    };
+    return `<span class="chip conf-${esc(level)}">${labels[level] || esc(level)}</span>`;
+  }
+
+  function drawConfidenceCard(box, detail) {
+    const conf = detail.elasticity_confidence;
+    if (!conf) {
+      box.innerHTML = `<div class="empty-note">Not modeled for this data
+        source.</div>`;
+      return;
+    }
+    if (conf.source !== "estimated") {
+      box.innerHTML = `
+        <div class="impact-row"><span class="k">Elasticity</span>
+          <span class="v">${fmt.num(detail.demand.elasticity, 2)}</span></div>
+        <div class="impact-row"><span class="k">Confidence</span>
+          <span class="v">${confidenceChip("fallback")}</span></div>
+        <div class="prov-note">Fallback estimate — ${esc(conf.reason)}.
+          A configured constant has no confidence interval, so none is
+          shown.</div>`;
+      return;
+    }
+    const level = Math.round((conf.confidence_level || 0.95) * 100);
+    const interval = (conf.lower_ci != null && conf.upper_ci != null)
+      ? `[${fmt.num(conf.lower_ci, 2)}, ${fmt.num(conf.upper_ci, 2)}]`
+      : "not identified";
+    box.innerHTML = `
+      <div class="impact-row"><span class="k">Elasticity</span>
+        <span class="v">${fmt.num(conf.elasticity, 2)}</span></div>
+      <div class="impact-row"><span class="k">${level}% confidence interval</span>
+        <span class="v">${interval}</span></div>
+      <div class="impact-row"><span class="k">Standard error</span>
+        <span class="v">${conf.standard_error == null ? "—"
+          : fmt.num(conf.standard_error, 3)}</span></div>
+      <div class="impact-row"><span class="k">Observations</span>
+        <span class="v">${fmt.num(conf.n_observations)}</span></div>
+      <div class="impact-row"><span class="k">Observed price levels</span>
+        <span class="v">${fmt.num(conf.n_distinct_prices)}</span></div>
+      <div class="impact-row"><span class="k">Confidence</span>
+        <span class="v">${confidenceChip(conf.confidence)}</span></div>
+      <div class="prov-note">${esc(conf.reason)} — log-log OLS on the
+        department's history.</div>`;
+  }
+
+  function drawReplenishmentCard(box, rep) {
+    if (!rep) {
+      box.innerHTML = `<div class="empty-note">Not available.</div>`;
+      return;
+    }
+    if (rep.status !== "known") {
+      box.innerHTML = `<div class="empty-note">${esc(rep.message)}</div>`;
+      return;
+    }
+    const next = rep.next_arrival;
+    box.innerHTML = `
+      <div class="impact-row"><span class="k">Next delivery</span>
+        <span class="v">${next.day === 1 ? "tomorrow"
+          : `in ${fmt.num(next.day)} days`}</span></div>
+      <div class="impact-row"><span class="k">Quantity expected</span>
+        <span class="v delta-pos">+${fmt.units(next.units)} units</span></div>
+      <div class="impact-row"><span class="k">Total scheduled</span>
+        <span class="v">${fmt.units(rep.total_units)} units</span></div>
+      <div style="margin-top: 10px">
+        ${rep.arrivals.map((a) => `<span class="chip hold">Day ${a.day}:
+          +${fmt.units(a.units)}</span>`).join(" ")}</div>
+      <div class="prov-note">Deliveries are planned as future events —
+        they can never be sold before they arrive.</div>`;
+  }
+
+  const ADAPTIVE_FACTORS = [
+    ["0.4", "Sells at 40% of forecast"],
+    ["0.7", "70%"],
+    ["1", "Matches forecast"],
+    ["1.3", "130%"],
+  ];
+
+  function setupAdaptiveCard(box, detail) {
+    box.innerHTML = `
+      <div class="mode-toggle" role="group"
+        aria-label="Actual demand relative to forecast">
+        ${ADAPTIVE_FACTORS.map(([v, label], i) => `
+          <button data-factor="${v}" class="${i === 0 ? "active" : ""}">
+            ${label}</button>`).join("")}
+      </div>
+      <div id="adaptive-result" style="margin-top: 14px">
+        <div class="skeleton" style="height: 180px"></div></div>`;
+
+    const result = () => document.getElementById("adaptive-result");
+    async function load(factor) {
+      try {
+        const sim = await api(
+          `/api/products/${detail.id}/adaptive?demand=${factor}`);
+        const target = result();
+        if (target) drawAdaptiveResult(target, sim);
+      } catch (err) {
+        const target = result();
+        if (target) {
+          target.innerHTML = `<div class="empty-note">Could not run the
+            simulation: ${esc(err.message)}</div>`;
+        }
+      }
+    }
+    box.querySelectorAll("button[data-factor]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        box.querySelectorAll("button[data-factor]").forEach((b) =>
+          b.classList.toggle("active", b === btn));
+        const target = result();
+        if (target) {
+          target.innerHTML =
+            `<div class="skeleton" style="height: 180px"></div>`;
+        }
+        load(btn.dataset.factor);
+      });
+    });
+    load(ADAPTIVE_FACTORS[0][0]);
+  }
+
+  function drawAdaptiveResult(box, sim) {
+    const o = sim.outcomes;
+    const wasteDelta = o.open_loop.waste_units - o.closed_loop.waste_units;
+    box.innerHTML = `
+      <div id="adaptive-chart"></div>
+      <div class="chart-legend">
+        <span class="key"><span class="swatch" style="background:#8B8B94"></span>day-0 plan (open loop)</span>
+        <span class="key"><span class="swatch" style="background:#7C5CFF"></span>prices actually acted (closed loop)</span>
+      </div>
+      <div class="table-wrap" style="margin-top: 14px">
+        <table class="compare strategy-table">
+          <thead><tr><th>Day</th><th class="num">Price acted</th>
+            <th class="num">Forecast sales</th>
+            <th class="num">Actual sales</th>
+            <th class="num">Surprise</th>
+            <th class="num">Delivery</th>
+            <th class="num">End inventory</th></tr></thead>
+          <tbody>
+            ${sim.days.map((d) => `
+              <tr><td>Day ${d.day}${d.censored
+                  ? ' <span class="map-conf">(sold out)</span>' : ""}</td>
+                <td class="num">${fmt.money(d.acted_price)}</td>
+                <td class="num">${fmt.units(d.forecast_sales)}</td>
+                <td class="num">${fmt.units(d.observed_sales)}</td>
+                <td class="num ${d.surprise < -0.05 ? "delta-warn"
+                  : d.surprise > 0.05 ? "delta-pos" : ""}">
+                  ${d.surprise > 0 ? "+" : ""}${fmt.units(d.surprise)}</td>
+                <td class="num">${d.arrivals_applied
+                  ? "+" + fmt.units(d.arrivals_applied) : "—"}</td>
+                <td class="num">${fmt.units(d.end_inventory)}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="impact-rows" style="margin-top: 14px">
+        <div class="impact-row"><span class="k">Closed-loop economic value</span>
+          <span class="v">${fmt.money(o.closed_loop.economic_value)}</span></div>
+        <div class="impact-row"><span class="k">Open-loop (blind) value</span>
+          <span class="v">${fmt.money(o.open_loop.economic_value)}</span></div>
+        <div class="impact-row"><span class="k">Value of daily feedback</span>
+          <span class="v ${sim.value_of_feedback >= 0 ? "delta-pos" : "delta-warn"}">
+            ${fmt.signedMoney(sim.value_of_feedback)}</span></div>
+        <div class="impact-row"><span class="k">Waste avoided by adapting</span>
+          <span class="v ${wasteDelta > 0 ? "delta-pos" : ""}">
+            ${fmt.units(wasteDelta)} units</span></div>
+        <div class="impact-row"><span class="k">Days the plan changed</span>
+          <span class="v">${fmt.num(sim.replans)}</span></div>
+      </div>
+      <div class="section-note" style="margin: 12px 0 0">${esc(sim.label)}.
+        Belief updates only use uncensored observations — a sold-out day
+        proves demand was at least the sales, so it never drags the
+        forecast down.</div>`;
+
+    Charts.lineChart(document.getElementById("adaptive-chart"), {
+      height: 210,
+      series: [
+        { points: stepPoints(sim.initial_plan), color: Charts.COLORS.line,
+          dash: "3 4", width: 1.5 },
+        { points: stepPoints(sim.acted_prices),
+          color: Charts.COLORS.accent, width: 2.5, area: true },
+      ],
+      xFormat: (v) => Number.isInteger(v) ? `Day ${v}` : "",
+      yFormat: (v) => "$" + v.toFixed(2),
+      ariaLabel: "Planned versus acted prices by day",
+    });
+  }
+
+  function drawAdaptiveBacktest(box, backtest) {
+    if (!backtest || backtest.available === false) {
+      box.innerHTML = `<div class="empty-note">${backtest
+        && backtest.message ? esc(backtest.message)
+        : "Not available for this data source."}</div>`;
+      return;
+    }
+    const rows = [
+      ["Revenue", "revenue", fmt.money],
+      ["Gross profit", "gross_profit", fmt.money],
+      ["Units sold", "units_sold", fmt.units],
+      ["Waste units", "waste_units", fmt.units],
+      ["Sell-through", "sell_through", (v) => fmt.pct(100 * v, 0)],
+      ["Economic value", "economic_value", fmt.money],
+    ];
+    const cols = [
+      ["hold", "Hold"], ["open_loop", "Open-loop path"],
+      ["closed_loop", "Closed loop (daily re-opt)"],
+    ];
+    box.innerHTML = `<div class="table-wrap">
+      <table class="compare strategy-table">
+      <thead><tr><th>Metric</th>
+        ${cols.map(([key, label]) => `
+          <th class="num ${key === "closed_loop" ? "col-rec" : ""}">
+            ${label}</th>`).join("")}
+      </tr></thead>
+      <tbody>${rows.map(([label, key, format]) => `
+        <tr><td>${label}</td>
+          ${cols.map(([ckey]) => `
+            <td class="num ${ckey === "closed_loop" ? "col-rec" : ""}">
+              ${format(backtest[ckey][key])}</td>`).join("")}
+        </tr>`).join("")}
+      </tbody></table></div>
+      <div class="section-note" style="margin-top: 10px">
+        ${fmt.num(backtest.n_products)} products, identical demand noise
+        for all three strategies; the closed loop replanned on
+        ${fmt.num(backtest.closed_loop_replans)} product-days. Episodes are
+        capped at ${fmt.num(backtest.episode_cap_days)} days for every
+        strategy alike.</div>`;
   }
 
   /* ---------- scenario ---------- */
@@ -1422,6 +1686,16 @@
         <div id="path-backtest-box"></div>
       </div>
 
+      <div class="card" style="margin-top: 24px" id="adaptive-backtest-card">
+        <div class="section-title">Closed-loop strategy backtest</div>
+        <div class="section-note">Hold vs executing the day-0 optimized
+          path blind vs re-optimizing every day from the observed state —
+          identical demand noise for all three. Synthetic simulation only —
+          not real-world performance.</div>
+        <div id="adaptive-backtest-box">
+          <div class="skeleton" style="height: 160px"></div></div>
+      </div>
+
       <div class="card" style="margin-top: 24px">
         <div class="section-title">Price changes</div>
         <div class="section-note">Current → recommended for every
@@ -1431,6 +1705,17 @@
 
     drawPathBacktest(
       document.getElementById("path-backtest-box"), data.path_backtest);
+
+    api("/api/backtest/adaptive").then((backtest) => {
+      const box = document.getElementById("adaptive-backtest-box");
+      if (box) drawAdaptiveBacktest(box, backtest);
+    }).catch((err) => {
+      const box = document.getElementById("adaptive-backtest-box");
+      if (box) {
+        box.innerHTML = `<div class="empty-note">Could not load the
+          closed-loop backtest: ${esc(err.message)}</div>`;
+      }
+    });
 
     Charts.barChart(document.getElementById("depth-chart"), {
       items: Object.entries(data.markdowns.depth_distribution).map(
@@ -1535,10 +1820,16 @@
   /* ---------- data page ---------- */
 
   const dataState = {
-    uploads: { products: null, transactions: null },
-    mappings: { products: {}, transactions: {} },
+    uploads: { products: null, transactions: null, replenishment: null },
+    mappings: { products: {}, transactions: {}, replenishment: {} },
     validation: null,
     busy: false,
+  };
+
+  const KIND_LABELS = {
+    products: "Products file",
+    transactions: "Transactions file",
+    replenishment: "Replenishment file (optional)",
   };
 
   function mappingFromSuggestions(payload) {
@@ -1584,13 +1875,16 @@
           — required, because demand is estimated from observed sales, and
           days missing from the history count as zero-sale days.</div>
         <div class="upload-grid">
-          ${["products", "transactions"].map((kind) => `
+          ${["products", "transactions", "replenishment"].map((kind) => `
             <div class="upload-box">
               <h4>${kind === "products" ? "Products (current shelf)"
-                : "Transactions (sales history)"}</h4>
+                : kind === "transactions" ? "Transactions (sales history)"
+                : "Replenishment (future deliveries) — optional"}</h4>
               <div class="hint">${kind === "products"
                 ? "product_id, product_name, category, current_price, cost, inventory, days_to_expiry, …"
-                : "date, product_id, price, units_sold, …"}</div>
+                : kind === "transactions"
+                ? "date, product_id, price, units_sold, …"
+                : "date, product_id, quantity — without it, inventory is modeled as non-replenished"}</div>
               <input type="file" accept=".csv,text/csv" data-kind="${kind}"
                 aria-label="Upload ${kind} CSV">
               <div class="file-ok" id="upload-ok-${kind}"></div>
@@ -1629,6 +1923,8 @@
             Recommendations CSV</a>
           <a class="btn" href="/api/export/paths.csv" download>
             Price paths CSV</a>
+          <a class="btn" href="/api/export/elasticity.csv" download>
+            Elasticity &amp; confidence CSV</a>
         </div>
       </div>`;
 
@@ -1728,25 +2024,42 @@
           ? new Date(meta.imported_at).toLocaleString() : "—"} ·
         elasticities by category:</div>
       <ul class="issue-list">
-        ${Object.entries(meta.elasticities || {}).map(([cat, e]) => `
+        ${Object.entries(meta.elasticities || {}).map(([cat, e]) => {
+          const conf = (meta.elasticity_confidence || {})[cat];
+          const interval = conf && conf.lower_ci != null
+            ? ` · 95% CI [${fmt.num(conf.lower_ci, 2)},
+                ${fmt.num(conf.upper_ci, 2)}]` : "";
+          return `
           <li class="${e.source === "estimated" ? "ok" : ""}">
             <strong>${esc(cat)}</strong>: ${fmt.num(e.elasticity, 2)}
             — ${e.source === "estimated"
-              ? `estimated from ${fmt.num(e.n_observations)} observations`
+              ? `estimated from ${fmt.num(e.n_observations)} observations${interval}`
               : `fallback (${esc(e.reason || "insufficient data")})`}
-          </li>`).join("")}
-      </ul>`;
+          </li>`;
+        }).join("")}
+      </ul>
+      ${meta.replenishment ? `
+        <div class="section-note" style="margin: 10px 0 0">
+          Replenishment: ${meta.replenishment.has_data
+            ? `${fmt.num(meta.replenishment.products_with_future_deliveries)}
+               product(s) with known future deliveries
+               (data timeline "today": ${esc(meta.replenishment.reference_date || "—")})`
+            : esc(meta.replenishment.message
+                || "no replenishment data supplied")}
+        </div>` : ""}`;
   }
 
   function drawMapping() {
     const box = document.getElementById("mapping-box");
     if (!box) return;
-    const kinds = ["products", "transactions"];
-    if (!kinds.every((k) => dataState.uploads[k])) {
-      box.innerHTML = `<div class="empty-note">Upload both files to map
-        their columns.</div>`;
+    const requiredKinds = ["products", "transactions"];
+    if (!requiredKinds.every((k) => dataState.uploads[k])) {
+      box.innerHTML = `<div class="empty-note">Upload both required files
+        to map their columns.</div>`;
       return;
     }
+    const kinds = dataState.uploads.replenishment
+      ? [...requiredKinds, "replenishment"] : requiredKinds;
     box.innerHTML = kinds.map((kind) => {
       const upload = dataState.uploads[kind];
       const fields = [
@@ -1756,7 +2069,7 @@
       return `
         <div style="margin-top: 8px">
           <h4 style="font-size:13.5px; margin-bottom: 2px">
-            ${kind === "products" ? "Products file" : "Transactions file"}
+            ${KIND_LABELS[kind]}
             <span class="map-conf">(${esc(upload.filename)})</span></h4>
           <div class="map-grid">
             ${fields.map(([fieldName, required]) => {
@@ -1819,6 +2132,10 @@
         products_mapping: dataState.mappings.products,
         transactions_mapping: dataState.mappings.transactions,
       };
+      if (dataState.uploads.replenishment
+          && Object.keys(dataState.mappings.replenishment).length) {
+        payload.replenishment_mapping = dataState.mappings.replenishment;
+      }
       const report = await apiPost("/api/data/validate", payload);
       dataState.validation = report;
       drawValidationReport(box, report);
@@ -1860,7 +2177,9 @@
       return `
         <div style="margin-top: 16px">
           <h4 style="font-size: 13.5px">
-            ${kind === "products" ? "Products" : "Transactions"} —
+            ${kind === "products" ? "Products"
+              : kind === "transactions" ? "Transactions"
+              : "Replenishment"} —
             <span class="${r.rows_rejected ? "delta-warn" : "delta-pos"}">
               ${fmt.num(r.rows_valid)} valid</span> /
             ${fmt.num(r.rows_total)} rows
@@ -1881,7 +2200,9 @@
         : `<div class="path-errors"><div>Fix the highlighted problems
             before importing.</div></div>`}
       ${section("products", report.products)}
-      ${section("transactions", report.transactions)}`;
+      ${section("transactions", report.transactions)}
+      ${report.replenishment
+        ? section("replenishment", report.replenishment) : ""}`;
   }
 
   /* ---------- router / boot ---------- */
