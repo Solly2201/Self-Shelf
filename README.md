@@ -152,6 +152,7 @@ Every simulated quantity is a named, documented parameter in `src/selfshelf/conf
 Self-Shelf/
 ├── src/
 │   ├── main.py                  CLI entry point
+│   ├── serve.py                 dashboard server entry point
 │   └── selfshelf/
 │       ├── config.py            all business assumptions (dataclasses)
 │       ├── economics.py         elasticity, expiry/inventory pressure,
@@ -163,7 +164,10 @@ Self-Shelf/
 │       ├── pso.py               deterministic particle swarm search
 │       ├── optimizer.py         per-product optimization + explanations
 │       ├── backtest.py          hold-vs-recommended counterfactual replay
-│       └── pipeline.py          end-to-end orchestration
+│       ├── pipeline.py          end-to-end orchestration
+│       ├── webdata.py           dashboard service layer over the engine
+│       └── webapp.py            FastAPI app serving data + dashboard
+├── web/                         dashboard frontend (no build step)
 ├── tests/                       unit + behavioral test suite
 ├── data/                        retail dataset (prices, departments,
 │                                promotions)
@@ -226,13 +230,34 @@ Output goes to `output/final_optimized_prices.csv` as a full economic audit of e
 
 ---
 
+## Dashboard
+
+```bash
+python src/serve.py                # http://127.0.0.1:8765
+python src/serve.py -n 100         # optimize 100 products instead of 50
+```
+
+A pricing-intelligence interface on top of the engine. The optimization runs once at startup (the UI shows progress until it finishes); every number displayed is computed by the engine — the frontend contains no economic formulas.
+
+- **Overview** — portfolio KPIs, the markdown queue ranked by expected economic improvement, inventory risk bands, the hold-vs-recommended synthetic backtest, and an economic-value curve explaining the top recommendation.
+- **Products** — searchable, sortable table of every recommendation with filters (markdown / hold / at risk / near expiry / high inventory pressure).
+- **Product detail** — the full story for one decision: economic value and demand curves across the allowed price range, keep-vs-recommended breakdown, break-even economics, structured reasons, markdown-now-vs-wait comparison, and a scenario slider that evaluates any allowed price live in the backend engine.
+- **Pricing** — a scenario lab for exploring candidate prices product by product.
+- **Analytics** — markdown depth distribution, risk bands, days-of-supply distribution, expected waste by department, and current→recommended price changes.
+
+Architecture: the frozen pricing engine → an in-process service layer (`webdata.py`) that runs the exact pipeline and keeps the rich per-product objects → a thin FastAPI adapter (`webapp.py`) → a dependency-free static frontend (`web/`). A parity test asserts the service serves recommendations identical to the CLI pipeline's output.
+
+The UI is explicitly labeled **Simulation mode** throughout: all figures are synthetic-simulation results, not real retail performance.
+
+---
+
 ## Testing
 
 ```bash
 python -m pytest
 ```
 
-The suite (≈150 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
+The suite (≈175 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
 
 - healthy inventory is not marked down
 - overstocked near-expiry stock receives meaningful downward pressure that measurably reduces expected waste
@@ -248,6 +273,8 @@ The suite (≈150 tests) covers the economic primitives and, more importantly, *
 - the whole pipeline and the backtest are reproducible end-to-end given a seed
 
 An audit suite additionally locks down: dimensional reconciliation of every objective component ($ = $/unit × units; the score equals the sum of its parts; units sold + terminal inventory = starting inventory), monetary-scale invariance, sensitivity monotonicity (waste cost, holding cost, inventory, remaining days, elasticity), PSO agreement with a 1001-point explicit grid on random products, whole-cent rounding invariants, the break-even/gross-profit equivalence, four distinct economic regimes (hold / shallow / moderate / deep markdown), and backtest counterfactual fairness (recommending the current price reproduces the hold strategy exactly).
+
+The dashboard layer has its own tests: the service adapter must serve recommendations byte-identical to the CLI pipeline (parity), aggregates must be exact sums over the served products, scenario evaluations must reproduce the engine's breakdown at the current price and clamp to the allowed range, and the API endpoints are exercised end to end (including 404s, validation, and the not-ready state during startup).
 
 ---
 
