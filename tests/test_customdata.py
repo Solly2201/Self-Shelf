@@ -399,3 +399,44 @@ class TestEstimateDemandParams:
             k: vars(v) for k, v in b.items()
         }
         assert cat_a == cat_b
+
+    def test_estimated_categories_carry_confidence_intervals(self):
+        config = PricingConfig()
+        _, categories = estimate_demand_params(self.make_dataset(), config)
+        for cat in ("Bakery", "Dairy"):
+            conf = categories[cat]["confidence"]
+            assert conf is not None
+            assert conf["source"] == "estimated"
+            # Interval brackets the same point estimate the engine prices
+            # with — the two can never disagree.
+            assert conf["elasticity"] == pytest.approx(
+                categories[cat]["elasticity"], abs=1e-4
+            )
+            assert conf["lower_ci"] < conf["elasticity"] < conf["upper_ci"]
+            assert conf["standard_error"] > 0
+            assert conf["n_observations"] == categories[cat]["n_observations"]
+
+    def test_fallback_categories_have_no_fake_interval(self):
+        config = PricingConfig()
+        _, categories = estimate_demand_params(self.make_dataset(), config)
+        conf = categories["Beverages"]["confidence"]
+        assert conf["confidence"] == "fallback"
+        assert conf["standard_error"] is None
+        assert conf["lower_ci"] is None and conf["upper_ci"] is None
+
+    def test_price_variation_fallback_confidence_reason_matches(self):
+        config = PricingConfig()
+        rows = []
+        for date in pd.date_range("2026-05-01", periods=80, freq="D"):
+            rows.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "product_id": "A1",
+                "price": 4.5,
+                "units_sold": 12.0,
+            })
+        _, categories = estimate_demand_params(
+            self.make_dataset(pd.DataFrame(rows)), config
+        )
+        conf = categories["Bakery"]["confidence"]
+        assert conf["confidence"] == "fallback"
+        assert conf["reason"] == categories["Bakery"]["reason"]

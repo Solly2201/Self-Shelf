@@ -36,6 +36,10 @@ import pandas as pd
 from .config import PricingConfig
 from .demand import estimate_elasticities
 from .economics import price_effect
+from .uncertainty import (
+    estimate_elasticities_with_confidence,
+    fallback_confidence,
+)
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -561,6 +565,11 @@ def estimate_demand_params(
         })
         frame = frame[np.isfinite(frame["PRICE_RATIO"])]
         estimates = estimate_elasticities(frame, config, min_observations)
+        # Same regression with OLS inference on top; the point estimates are
+        # identical to ``estimates`` by construction (see uncertainty.py).
+        confidence_estimates = estimate_elasticities_with_confidence(
+            frame, config, min_observations
+        )
 
         frame_sorted = frame.sort_values("date")
         cutoff = max(1, int(len(frame_sorted) * 0.8))
@@ -570,6 +579,8 @@ def estimate_demand_params(
 
         for cat, group in frame.groupby("DEPARTMENT"):
             est = estimates.get(cat)
+            conf = confidence_estimates.get(cat)
+            n_levels = int(conf.n_distinct_prices) if conf else 0
             variation = float(group["PRICE_RATIO"].std() or 0.0)
             n_obs = int(est.n_observations) if est else 0
             if est is None or est.source == "default":
@@ -584,17 +595,26 @@ def estimate_demand_params(
                     "elasticity": fallback, "source": "fallback",
                     "n_observations": n_obs, "price_variation": variation,
                     "reason": reason, "stability": None,
+                    "confidence": fallback_confidence(
+                        fallback, reason, n_observations=n_obs,
+                        n_distinct_prices=n_levels,
+                    ).as_dict(),
                 }
                 continue
             if variation < min_price_variation:
+                reason = (
+                    "insufficient price variation in the history "
+                    f"({variation:.3f} < {min_price_variation})"
+                )
                 categories[cat] = {
                     "elasticity": fallback, "source": "fallback",
                     "n_observations": n_obs, "price_variation": variation,
-                    "reason": (
-                        "insufficient price variation in the history "
-                        f"({variation:.3f} < {min_price_variation})"
-                    ),
+                    "reason": reason,
                     "stability": None,
+                    "confidence": fallback_confidence(
+                        fallback, reason, n_observations=n_obs,
+                        n_distinct_prices=n_levels,
+                    ).as_dict(),
                 }
                 continue
             early_est = early.get(cat)
@@ -607,15 +627,21 @@ def estimate_demand_params(
                 "n_observations": n_obs, "price_variation": variation,
                 "reason": "estimated from observed price variation",
                 "stability": stability,
+                "confidence": (
+                    conf.as_dict()
+                    if conf is not None and conf.source == "estimated"
+                    else None
+                ),
             }
     # Categories that exist in products but have no transactions at all.
     for cat in products["category"].unique():
         if cat not in categories:
+            reason = "no transaction history for this category"
             categories[cat] = {
                 "elasticity": fallback, "source": "fallback",
                 "n_observations": 0, "price_variation": 0.0,
-                "reason": "no transaction history for this category",
-                "stability": None,
+                "reason": reason, "stability": None,
+                "confidence": fallback_confidence(fallback, reason).as_dict(),
             }
 
     # -- per-product baseline demand ----------------------------------------
