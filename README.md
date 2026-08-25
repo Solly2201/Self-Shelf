@@ -240,7 +240,7 @@ The default. Demand, costs, expiry dates, and inventory come from the documented
 
 ### Custom data mode
 
-Import your own data on the dashboard's **Data** page (or via the API). Two CSV files:
+Import your own data on the dashboard's **Data** page (or via the API). Two required CSV files, plus an optional third for deliveries:
 
 **Products** — one row per product, the current state of the shelf:
 
