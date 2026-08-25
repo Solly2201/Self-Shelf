@@ -171,6 +171,18 @@ class TestReferenceValidation:
                     >= result.hold["score"] - 1e-9
                 )
 
+    def test_never_worse_than_the_one_shot_recommendation(self, config):
+        # The one-shot price is injected as a candidate level even when it
+        # falls between grid points, so the path can never lose to it.
+        for single in (3.5, 4.11, 4.437, 2.95):
+            product = make_product(inventory_units=90, days_to_expiry=7)
+            result = optimize_path(product, config, single_price=single)
+            if result.single is not None:
+                assert (
+                    result.evaluation["score"]
+                    >= result.single["score"] - 1e-9
+                )
+
 
 # ---------------------------------------------------------------------------
 # Economic behavior

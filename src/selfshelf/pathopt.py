@@ -243,6 +243,17 @@ def optimize_path(
     levels = candidate_price_levels(product, config, num_levels)
     cur = product.current_price
 
+    # The one-shot recommendation is always a candidate level: the grid is
+    # coarser than the PSO search, and the path optimizer must never return
+    # a schedule worse than simply applying the one-shot price all week.
+    if single_price is not None:
+        sp = float(single_price)
+        floor = path_price_floor(product, config)
+        if floor - _EPS <= sp < cur - _EPS and all(
+            abs(sp - level) > _EPS for level in levels
+        ):
+            levels = sorted([*levels, sp], reverse=True)
+
     best_schedule: Schedule = [(horizon, cur)]
     best_eval = evaluate_price_path(product, config, best_schedule)
     best_score = best_eval["score"]

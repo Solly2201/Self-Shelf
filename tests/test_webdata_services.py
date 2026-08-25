@@ -99,12 +99,18 @@ class TestPathView:
         assert service.path("NOPE") is None
         assert service.path_scenario("NOPE", [1.0]) is None
 
-    def test_path_never_worse_than_hold(self, service):
+    def test_path_never_worse_than_hold_or_immediate(self, service):
         for summary in service.products():
             payload = service.path(summary["id"])
             rec = payload["strategies"]["recommended"]["econ"]
             hold = payload["strategies"]["hold"]["econ"]
             assert rec["economic_value"] >= hold["economic_value"] - 0.01
+            immediate = payload["strategies"].get("immediate")
+            if immediate:
+                assert (
+                    rec["economic_value"]
+                    >= immediate["econ"]["economic_value"] - 0.01
+                )
 
     def test_markdown_product_has_immediate_strategy(self, service):
         marked = [
