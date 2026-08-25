@@ -69,6 +69,7 @@ def backtest_closed_loop(
     contexts: Sequence[ProductContext],
     config: PricingConfig,
     max_products: Optional[int] = None,
+    max_days: Optional[int] = None,
 ) -> Dict[str, object]:
     """Hold vs open-loop path vs daily closed-loop re-optimization.
 
@@ -83,7 +84,7 @@ def backtest_closed_loop(
     }
     n = 0
     replans_total = 0
-    max_days = int(items["DAYS_TO_EXPIRY"].max()) if len(items) else 0
+    noise_days = int(items["DAYS_TO_EXPIRY"].max()) if len(items) else 0
 
     for pos, (_, row) in enumerate(items.iterrows()):
         if max_products is not None and pos >= max_products:
@@ -92,7 +93,7 @@ def backtest_closed_loop(
         rng = np.random.default_rng([config.seed, 7919, pos])
         noise = rng.lognormal(
             mean=0.0, sigma=config.simulator.noise_sigma,
-            size=max(max_days, 1),
+            size=max(noise_days, 1),
         )
         env = _environment_for_row(row, config, noise)
         days = max(1, int(context.days_to_expiry))
@@ -100,9 +101,14 @@ def backtest_closed_loop(
         hold = run_closed_loop(
             context, config, env,
             fixed_daily_prices=[context.current_price] * days,
+            max_days=max_days,
         )
-        open_loop = run_closed_loop(context, config, env, reoptimize=False)
-        closed = run_closed_loop(context, config, env, reoptimize=True)
+        open_loop = run_closed_loop(
+            context, config, env, reoptimize=False, max_days=max_days
+        )
+        closed = run_closed_loop(
+            context, config, env, reoptimize=True, max_days=max_days
+        )
 
         for strategy, result in (
             ("hold", hold), ("open_loop", open_loop), ("closed_loop", closed),

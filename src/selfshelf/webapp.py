@@ -35,6 +35,7 @@ from .customdata import (
     save_dataset,
     suggest_mapping,
     validate_products,
+    validate_replenishment,
     validate_transactions,
 )
 from .webdata import CustomPricingService, PricingService
@@ -239,6 +240,50 @@ def create_app(
             raise HTTPException(404, detail=f"Unknown product {sku}")
         return result
 
+    # -- adaptive views ------------------------------------------------------
+
+    @app.get("/api/products/{sku}/elasticity")
+    def product_elasticity(sku: str):
+        payload = require_ready().elasticity_detail(sku)
+        if payload is None:
+            raise HTTPException(404, detail=f"Unknown product {sku}")
+        return payload
+
+    @app.get("/api/products/{sku}/replenishment")
+    def product_replenishment(sku: str):
+        payload = require_ready().replenishment_info(sku)
+        if payload is None:
+            raise HTTPException(404, detail=f"Unknown product {sku}")
+        return payload
+
+    @app.get("/api/products/{sku}/adaptive")
+    def product_adaptive(
+        sku: str,
+        demand: float = Query(0.5, gt=0.0, le=3.0),
+        noise_seed: Optional[int] = Query(None, ge=0),
+    ):
+        payload = require_ready().adaptive_simulation(
+            sku, demand_factor=demand, noise_seed=noise_seed
+        )
+        if payload is None:
+            raise HTTPException(404, detail=f"Unknown product {sku}")
+        return payload
+
+    @app.get("/api/backtest/adaptive")
+    def adaptive_backtest():
+        service = require_ready()
+        payload = service.adaptive_backtest()
+        if payload is None:
+            return {
+                "available": False,
+                "message": (
+                    "The closed-loop backtest requires the synthetic "
+                    "source: imported data has no ground-truth demand "
+                    "process to replay against."
+                ),
+            }
+        return {"available": True, **payload}
+
     @app.get("/api/analytics")
     def analytics():
         return require_ready().analytics()
@@ -270,6 +315,14 @@ def create_app(
             f"selfshelf_price_paths_{service.source}.csv",
         )
 
+    @app.get("/api/export/elasticity.csv")
+    def export_elasticity():
+        service = require_ready()
+        return _csv_response(
+            service.export_elasticity_csv(),
+            f"selfshelf_elasticity_{service.source}.csv",
+        )
+
     # -- custom data import --------------------------------------------------
 
     def _upload_file(kind: str) -> Path:
@@ -290,7 +343,9 @@ def create_app(
 
     @app.post("/api/data/upload")
     async def data_upload(
-        kind: str = Query(..., pattern="^(products|transactions)$"),
+        kind: str = Query(
+            ..., pattern="^(products|transactions|replenishment)$"
+        ),
         file: UploadFile = File(...),
     ):
         raw = await file.read()
@@ -325,6 +380,7 @@ def create_app(
     def _validate_both(
         products_mapping: Dict[str, str],
         transactions_mapping: Dict[str, str],
+        replenishment_mapping: Optional[Dict[str, str]] = None,
     ):
         products_result = validate_products(
             _read_upload("products"), products_mapping
@@ -338,7 +394,17 @@ def create_app(
             _read_upload("transactions"), transactions_mapping,
             known_ids=list(known),
         )
-        return products_result, transactions_result
+        # Replenishment is optional: validated only when a file has been
+        # uploaded and a mapping provided; otherwise the import proceeds
+        # without it (and the model states that inventory is
+        # non-replenished).
+        replenishment_result = None
+        if replenishment_mapping and _upload_file("replenishment").exists():
+            replenishment_result = validate_replenishment(
+                _read_upload("replenishment"), replenishment_mapping,
+                known_ids=list(known),
+            )
+        return products_result, transactions_result, replenishment_result
 
     def _preview(frame: pd.DataFrame, limit: int = 8):
         head = frame.head(limit)
@@ -348,14 +414,17 @@ def create_app(
             orient="records"
         )
 
-    def _persist_rejected(products_result, transactions_result):
+    def _persist_rejected(
+        products_result, transactions_result, replenishment_result=None
+    ):
         custom_path.mkdir(parents=True, exist_ok=True)
         for kind, result in (
             ("products", products_result),
             ("transactions", transactions_result),
+            ("replenishment", replenishment_result),
         ):
             rejected_file = custom_path / f"rejected_{kind}.csv"
-            if len(result.rejected):
+            if result is not None and len(result.rejected):
                 result.rejected.to_csv(rejected_file, index=False)
             elif rejected_file.exists():
                 rejected_file.unlink()
@@ -364,12 +433,18 @@ def create_app(
     def data_validate(
         products_mapping: Dict[str, str] = Body(...),
         transactions_mapping: Dict[str, str] = Body(...),
+        replenishment_mapping: Optional[Dict[str, str]] = Body(None),
     ):
-        products_result, transactions_result = _validate_both(
-            products_mapping, transactions_mapping
+        products_result, transactions_result, replenishment_result = (
+            _validate_both(
+                products_mapping, transactions_mapping,
+                replenishment_mapping,
+            )
         )
-        _persist_rejected(products_result, transactions_result)
-        return {
+        _persist_rejected(
+            products_result, transactions_result, replenishment_result
+        )
+        payload = {
             "products": {
                 **products_result.summary(),
                 "preview": _preview(products_result.valid),
@@ -385,15 +460,25 @@ def create_app(
                 and len(transactions_result.valid)
             ),
         }
+        if replenishment_result is not None:
+            payload["replenishment"] = {
+                **replenishment_result.summary(),
+                "preview": _preview(replenishment_result.valid),
+            }
+        return payload
 
     @app.post("/api/data/import")
     def data_import(
         products_mapping: Dict[str, str] = Body(...),
         transactions_mapping: Dict[str, str] = Body(...),
+        replenishment_mapping: Optional[Dict[str, str]] = Body(None),
     ):
         with lock:
-            products_result, transactions_result = _validate_both(
-                products_mapping, transactions_mapping
+            products_result, transactions_result, replenishment_result = (
+                _validate_both(
+                    products_mapping, transactions_mapping,
+                    replenishment_mapping,
+                )
             )
             if not products_result.ok or not len(products_result.valid):
                 raise HTTPException(400, detail={
@@ -414,6 +499,20 @@ def create_app(
                     ],
                 })
 
+            if (
+                replenishment_result is not None
+                and not replenishment_result.ok
+            ):
+                raise HTTPException(400, detail={
+                    "message": "the replenishment file cannot be imported",
+                    "errors": replenishment_result.errors,
+                })
+            replenishment_valid = (
+                replenishment_result.valid
+                if replenishment_result is not None
+                and len(replenishment_result.valid)
+                else None
+            )
             dataset = CustomDataset(
                 products_result.valid,
                 transactions_result.valid,
@@ -426,11 +525,15 @@ def create_app(
                     mappings={
                         "products": products_mapping,
                         "transactions": transactions_mapping,
+                        "replenishment": replenishment_mapping or {},
                     },
                 ),
+                replenishment=replenishment_valid,
             )
             save_dataset(dataset, str(custom_path))
-            _persist_rejected(products_result, transactions_result)
+            _persist_rejected(
+                products_result, transactions_result, replenishment_result
+            )
 
             if not compute_custom():
                 raise HTTPException(400, detail={
@@ -441,7 +544,7 @@ def create_app(
             save_state()
 
         service = services["custom"]
-        return {
+        payload = {
             "imported": True,
             "source": "custom",
             "quality": service.meta()["quality"],
@@ -452,7 +555,11 @@ def create_app(
                 **transactions_result.summary(),
             },
             "elasticities": service.meta()["elasticities"],
+            "replenishment": service.meta()["replenishment"],
         }
+        if replenishment_result is not None:
+            payload["replenishment_rows"] = replenishment_result.summary()
+        return payload
 
     @app.post("/api/data/source")
     def data_source(source: str = Body(..., embed=True)):
@@ -476,7 +583,7 @@ def create_app(
         meta = custom.meta() if custom is not None and custom.ready else None
         rejected = {
             kind: (custom_path / f"rejected_{kind}.csv").exists()
-            for kind in ("products", "transactions")
+            for kind in ("products", "transactions", "replenishment")
         }
         return {
             "active_source": state["active"],
@@ -488,13 +595,15 @@ def create_app(
             },
             "uploads": {
                 kind: _upload_file(kind).exists()
-                for kind in ("products", "transactions")
+                for kind in ("products", "transactions", "replenishment")
             },
         }
 
     @app.get("/api/data/rejected")
     def data_rejected(
-        kind: str = Query(..., pattern="^(products|transactions)$"),
+        kind: str = Query(
+            ..., pattern="^(products|transactions|replenishment)$"
+        ),
     ):
         path = custom_path / f"rejected_{kind}.csv"
         if not path.exists():

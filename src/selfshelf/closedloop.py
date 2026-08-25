@@ -249,6 +249,7 @@ def run_closed_loop(
     replenishment: Optional[ReplenishmentSchedule] = None,
     reoptimize: bool = True,
     fixed_daily_prices: Optional[Sequence[float]] = None,
+    max_days: Optional[int] = None,
 ) -> ClosedLoopResult:
     """Deterministic closed-loop episode over the remaining shelf life.
 
@@ -266,6 +267,10 @@ def run_closed_loop(
     schedule = replenishment or ReplenishmentSchedule.empty()
     state = initial_state(product)
     days = max(1, int(product.days_to_expiry))
+    if max_days is not None:
+        # Bounded episode: the loop stops before expiry; unexpired stock
+        # ends as terminal inventory, not waste, for every strategy alike.
+        days = min(days, max(1, int(max_days)))
     fixed = (
         [float(p) for p in fixed_daily_prices]
         if fixed_daily_prices is not None else None
