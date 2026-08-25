@@ -748,11 +748,162 @@ input[type="range"] {
 .stat-pair .stat .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .stat-pair .stat .l { font-size: 12px; color: var(--text-3); }
 
+/* ---------- Data source / custom mode ---------- */
+
+.sim-badge.custom {
+  color: var(--positive);
+  border-color: rgba(76, 175, 125, 0.35);
+}
+
+.mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.mode-toggle button {
+  padding: 7px 16px;
+  font-size: 13px;
+  color: var(--text-2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.mode-toggle button.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.upload-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+
+.upload-box {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 18px;
+}
+
+.upload-box h4 { font-size: 13.5px; margin-bottom: 4px; }
+.upload-box .hint { font-size: 12px; color: var(--text-3); margin-bottom: 12px; }
+.upload-box input[type="file"] { font-size: 12.5px; color: var(--text-2); max-width: 100%; }
+.upload-box .file-ok { color: var(--positive); font-size: 12.5px; margin-top: 8px; }
+
+.map-grid {
+  display: grid;
+  grid-template-columns: 150px 1fr auto;
+  gap: 8px 14px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.map-grid .fname { font-size: 13px; color: var(--text-2); }
+.map-grid .fname .req { color: var(--warning); }
+
+.select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 10px;
+  width: 100%;
+}
+.select:focus { outline: none; border-color: var(--accent); }
+
+.map-conf { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.map-conf.exact { color: var(--positive); }
+
+.issue-list { list-style: none; margin: 10px 0 0; padding: 0; }
+.issue-list li {
+  font-size: 12.5px;
+  color: var(--text-2);
+  padding: 5px 0 5px 16px;
+  position: relative;
+}
+.issue-list li::before {
+  content: "";
+  position: absolute;
+  left: 2px; top: 11px;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+.issue-list li.err::before { background: var(--danger); }
+.issue-list li.ok::before { background: var(--positive); }
+
+.quality-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.quality-cell {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.quality-cell .n { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.quality-cell .l { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+
+.prov-note {
+  font-size: 12px;
+  color: var(--text-3);
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  margin-top: 10px;
+}
+.prov-note .estimated { color: var(--positive); }
+.prov-note .fallback { color: var(--warning); }
+
+/* ---------- Multi-period path ---------- */
+
+.path-days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.path-day {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 74px;
+}
+
+.path-day label { font-size: 11px; color: var(--text-3); }
+
+.path-day input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 8px;
+  width: 74px;
+  font-variant-numeric: tabular-nums;
+}
+.path-day input:focus { outline: none; border-color: var(--accent); }
+.path-day input.changed { border-color: var(--accent); }
+
+.path-errors { color: var(--danger); font-size: 12.5px; margin: 8px 0; }
+.path-errors div { padding: 2px 0; }
+
+.strategy-table td.strat-name { color: var(--text-2); }
+.strategy-table .best { color: var(--accent); font-weight: 600; }
+
 /* ---------- Responsive ---------- */
 
 @media (max-width: 1100px) {
   .overview-grid, .detail-grid, .analytics-grid { grid-template-columns: 1fr; }
   .topbar-inner { gap: 20px; }
+  .upload-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 800px) {

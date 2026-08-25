@@ -348,6 +348,18 @@ def create_app(
             orient="records"
         )
 
+    def _persist_rejected(products_result, transactions_result):
+        custom_path.mkdir(parents=True, exist_ok=True)
+        for kind, result in (
+            ("products", products_result),
+            ("transactions", transactions_result),
+        ):
+            rejected_file = custom_path / f"rejected_{kind}.csv"
+            if len(result.rejected):
+                result.rejected.to_csv(rejected_file, index=False)
+            elif rejected_file.exists():
+                rejected_file.unlink()
+
     @app.post("/api/data/validate")
     def data_validate(
         products_mapping: Dict[str, str] = Body(...),
@@ -356,6 +368,7 @@ def create_app(
         products_result, transactions_result = _validate_both(
             products_mapping, transactions_mapping
         )
+        _persist_rejected(products_result, transactions_result)
         return {
             "products": {
                 **products_result.summary(),
@@ -417,15 +430,7 @@ def create_app(
                 ),
             )
             save_dataset(dataset, str(custom_path))
-            for kind, result in (
-                ("products", products_result),
-                ("transactions", transactions_result),
-            ):
-                rejected_file = custom_path / f"rejected_{kind}.csv"
-                if len(result.rejected):
-                    result.rejected.to_csv(rejected_file, index=False)
-                elif rejected_file.exists():
-                    rejected_file.unlink()
+            _persist_rejected(products_result, transactions_result)
 
             if not compute_custom():
                 raise HTTPException(400, detail={
