@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Self-Shelf — Pricing Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="wordmark" href="#/overview" aria-label="Self-Shelf home">
+          <span class="wordmark-glyph" aria-hidden="true"></span>
+          Self-Shelf
+        </a>
+        <nav class="nav" aria-label="Primary">
+          <a href="#/overview" data-nav="overview">Overview</a>
+          <a href="#/products" data-nav="products">Products</a>
+          <a href="#/pricing" data-nav="pricing">Pricing</a>
+          <a href="#/analytics" data-nav="analytics">Analytics</a>
+        </nav>
+        <div class="topbar-meta">
+          <span class="sim-badge" title="All data comes from the synthetic retail simulator">Simulation mode</span>
+          <span class="updated" id="last-updated"></span>
+        </div>
+      </div>
+    </header>
+
+    <main id="view" class="view" tabindex="-1"></main>
+
+    <footer class="footer">
+      <span>Self-Shelf pricing engine — synthetic retail simulation. Results are not real-world retail performance.</span>
+    </footer>
+  </div>
+
+  <script src="charts.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
