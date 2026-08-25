@@ -9,6 +9,7 @@ venv/
 # Local academic/project material
 Code/
 Reports/
+research/
 
 # Generated analysis artifacts (the sample recommendations CSV is tracked)
 output/*_sweep.csv
