@@ -66,18 +66,21 @@ The engine compares **days of supply** (`inventory / predicted daily demand`) wi
 
 ```text
 expected waste units = max(0, inventory − daily demand × days_to_expiry)
-waste cost           = waste units × (unit cost − salvage value) × expiry pressure
+waste cost           = waste units × (unit cost − salvage value) × risk weight
 ```
 
-The expiry-pressure weighting discounts waste that is still far in the future (there will be later chances to correct course) while charging the full loss for stock expiring now.
+Waste projected to occur **inside the decision window** is certain under the demand forecast, so it is charged in full. Waste projected beyond the window can still be averted by future repricing, so it is discounted exponentially with the time remaining after the window closes.
+
+### Holding cost
+
+Carrying cost applies to **unit-days actually held** as stock sells down (the integral of remaining inventory over time), so a markdown that accelerates sell-through genuinely reduces it. It defaults to 0 — no fabricated carrying rate — and setting it to a positive value makes earlier clearance measurably more attractive.
 
 ### The objective
 
 PSO maximizes a modular economic score:
 
 ```text
-score(P) = expected revenue(P)
-         − COGS(P)
+score(P) = gross profit(P)            [revenue − COGS, in dollars]
          − expected waste cost(P)
          − holding cost(P)
          − markdown friction(P)
@@ -91,19 +94,38 @@ subject to constraints:
 - ceiling at the current price (price increases are disabled by default, configurable)
 - never above the retail/list price
 
-A markdown is only recommended when it **improves** the economic score; otherwise the price is maintained.
+Each dollar is counted once: COGS is charged only on units expected to sell, expired units lose `(cost − salvage)`, and unsold-but-unexpired units keep their book value.
+
+### The markdown decision
+
+The current price is always an explicit candidate — the optimizer's winner is compared against the **no-markdown baseline**, and a markdown is recommended only when
+
+```text
+Economic Value(markdown) > Economic Value(current price)
+```
+
+Nothing marks a product down merely because expiry is near: a near-expiry product with an inelastic demand response keeps its price when the waste avoided cannot pay for the margin given up.
+
+Two classic sanity metrics are computed for every markdown:
+
+- **Break-even unit uplift** — `(P₀ − C) / (P₁ − C)`, the volume multiplier needed to hold gross profit. A 20% markdown on a 40%-margin product needs ~2× the volume. Recommendations report this hurdle next to the predicted uplift, so it is explicit when a markdown is justified by waste/terminal-stock avoidance rather than by demand stimulation alone.
+- **Timing advantage** — a simplified two-path comparison (markdown now for the whole window vs hold for a few days, then apply the same markdown) quantifying the value preserved by acting early. This is a fixed-path evaluation, not a full multi-period optimization; staged markdown scheduling remains future work.
+
+Markdown **depth** is discovered by the optimizer from elasticity, inventory pressure, remaining time, margin and waste economics — there are no "urgent = 30% off" rules, and the deepest allowed discount is chosen only when it actually scores best.
 
 ### Explanations
 
 Every recommendation carries a structured reason built from the actual numbers, e.g.:
 
 ```text
-8.0 days of supply vs 4 days of shelf life remaining;
-expiry pressure is high (0.55) with 4 day(s) left;
-~77 of 154 units are expected to expire unsold at the current price;
-marking down to $2.32 cuts expected waste by ~34 units;
-demand is price-sensitive (elasticity -1.81): predicted daily demand rises from 19.3 to 27.8;
-expected economic outcome improves by $3.76 over the evaluation window
+5.5 days of supply vs 5 days of shelf life remaining;
+~8 of 95 units are expected to expire unsold at the current price;
+expected sell-through rises from 91% to 100%;
+marking down to $4.72 cuts expected waste by ~8 units;
+demand is price-sensitive (elasticity -1.60): predicted daily demand rises from 17.4 to 19.0;
+gross-profit break-even needs 1.22x unit volume; predicted uplift is 1.09x (does not meet the hurdle on margin alone);
+acting now rather than waiting 3 day(s) preserves ~$7.99 of expected value;
+expected economic outcome improves by $13.31 over the evaluation window
 ```
 
 ---
@@ -140,6 +162,7 @@ Self-Shelf/
 │       ├── evaluation.py        train/validation/test split + metrics
 │       ├── pso.py               deterministic particle swarm search
 │       ├── optimizer.py         per-product optimization + explanations
+│       ├── backtest.py          hold-vs-recommended counterfactual replay
 │       └── pipeline.py          end-to-end orchestration
 ├── tests/                       unit + behavioral test suite
 ├── data/                        retail dataset (prices, departments,
@@ -178,20 +201,26 @@ pip install -r requirements.txt
 python src/main.py                 # optimize 25 test-set products
 python src/main.py -n 100          # optimize 100
 python src/main.py --sweep         # also write per-product price sweeps
+python src/main.py --backtest      # replay hold vs recommended (synthetic)
 python src/main.py --seed 7        # different reproducible run
 ```
 
-Output goes to `output/final_optimized_prices.csv` with columns including:
+Output goes to `output/final_optimized_prices.csv` as a full economic audit of each decision:
 
 | Field | Description |
 |---|---|
-| `Optimized_Price`, `Markdown_Percentage`, `Action` | the recommendation |
+| `Recommended_Price`, `Markdown_Percentage`, `Action` | the recommendation |
 | `Days_To_Expiry`, `Inventory_Units`, `Days_Of_Supply` | inventory situation |
-| `Elasticity`, `Expiry_Pressure` | economic inputs |
-| `Predicted_Demand_Current` / `_Optimized` | demand at both prices |
-| `Expected_Revenue`, `Expected_Profit` | over the evaluation window |
-| `Expected_Waste_Units` (+ at current price) | waste impact of the markdown |
+| `Elasticity`, `Expiry_Pressure`, `Inventory_Pressure` | economic inputs |
+| `Predicted_Demand_Current` / `_Optimized` | daily demand at both prices |
+| `Expected_Units_Sold_*`, `Sell_Through_*` | sell-down at both prices |
+| `Gross_Revenue_*`, `Gross_Profit_*` | dollars over the evaluation window |
+| `Expected_Waste_*`, `Terminal_Inventory_*`, `Holding_Cost_*` | stock outcomes |
+| `Economic_Value_Current` / `_Optimized` / `_Improvement` | the actual decision criterion |
+| `Break_Even_Unit_Uplift`, `Predicted_Unit_Uplift` | gross-profit hurdle vs forecast |
 | `Economic_Reason` | structured explanation |
+
+`--backtest` replays every recommendation day by day under the synthetic simulator's ground truth (identical noise for both strategies) and prints hold-vs-recommended revenue, gross profit, waste, sell-through and cash recovered. The output is labeled a **synthetic simulation** — it measures optimization quality inside the simulated economy, not real-world performance.
 
 `--sweep` additionally writes `final_optimized_prices_sweep.csv`: demand, revenue, profit, waste, and economic score across the feasible price range for each product — the data behind price–demand and profit curves.
 
@@ -203,15 +232,20 @@ Output goes to `output/final_optimized_prices.csv` with columns including:
 python -m pytest
 ```
 
-The suite (≈90 tests) covers the economic primitives and, more importantly, **business behavior**:
+The suite (≈130 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
 
 - healthy inventory is not marked down
 - overstocked near-expiry stock receives meaningful downward pressure that measurably reduces expected waste
 - extremely urgent stock gets strong clearance behavior within configured bounds
-- highly price-sensitive products get markdowns that *increase* expected profit
-- price-insensitive products keep their price
-- prices always respect bounds, waste/sales are never negative, zero-demand edge cases are safe
-- the whole pipeline is reproducible end-to-end given a seed
+- near-expiry but *inelastic* products are **not** forced into markdowns — expiry alone never triggers a discount
+- highly price-sensitive products get markdowns that *increase* expected profit; price-insensitive products keep their price
+- the break-even uplift formula agrees with the objective's gross-profit crossover
+- the deepest allowed discount is not automatically chosen (interior optima beat the floor; the recommendation is the argmax of an explicit candidate grid)
+- tiny stock with strong demand keeps its price while large stock with weak demand at the same expiry is marked down
+- zero holding cost creates no artificial markdown pressure; positive holding cost makes clearing measurably more attractive
+- price-path evaluation reproduces the one-shot objective exactly, and acting now beats waiting for overstocked short-dated stock
+- prices always respect bounds, waste/sales are never negative, zero-demand/zero-inventory/cost-above-price edge cases are safe
+- the whole pipeline and the backtest are reproducible end-to-end given a seed
 
 ---
 
@@ -230,6 +264,11 @@ Before production use, these configured assumptions must be replaced with real d
 | Holding cost | `holding_cost_per_unit_day` | 0 |
 | Minimum margin / clearance floor | `ConstraintConfig` | 5% / 50% of cost |
 | Markdown friction | `ObjectiveConfig` | 5% of discounted dollars |
+
+Beyond data, two modeling limitations are known and deliberate:
+
+- **One-shot pricing.** The engine picks one price per run. The price-path evaluator provides the foundation for staged markdowns (small cut → observe → deeper cut), but full multi-period optimization with daily re-decisions is future work — the current timing comparison evaluates fixed paths only.
+- **Myopic customers.** Demand depends only on today's price. The markdown literature shows strategic customers who anticipate future discounts can change optimal markdown policies; nothing here models that, and no claim is made either way.
 
 ---
 
