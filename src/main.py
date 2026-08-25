@@ -41,6 +41,11 @@ def parse_args(argv=None):
         help="also write a per-product price sweep CSV next to the output",
     )
     parser.add_argument(
+        "--backtest", action="store_true",
+        help="replay hold-vs-recommended strategies against the synthetic "
+             "demand simulator and print the comparison",
+    )
+    parser.add_argument(
         "--seed", type=int, default=None,
         help="random seed for the whole run (default: from config)",
     )
@@ -66,6 +71,7 @@ def main(argv=None) -> int:
         config=config,
         num_items=args.items,
         collect_sweeps=args.sweep,
+        collect_backtest=args.backtest,
         progress=True,
     )
 
@@ -96,6 +102,24 @@ def main(argv=None) -> int:
     actions = result.recommendations["Action"].value_counts().to_dict()
     print(f"\n5. Actions: {json.dumps(actions)}")
     print(f"   Run configuration: {json.dumps(result.config_summary)}")
+
+    if result.backtest is not None:
+        bt = result.backtest
+        print(f"\n6. Backtest — {bt['label']}")
+        print(f"   {bt['n_products']} products, {bt['n_markdowns']} markdowns "
+              f"(avg depth {bt['avg_markdown_pct']:.1f}%)")
+        header = f"   {'':<14}{'hold':>14}{'recommended':>14}"
+        print(header)
+        for key, label in (
+            ("revenue", "revenue $"),
+            ("gross_profit", "gross profit $"),
+            ("units_sold", "units sold"),
+            ("waste_units", "waste units"),
+            ("sell_through", "sell-through"),
+            ("cash_recovered", "cash recov. $"),
+        ):
+            print(f"   {label:<14}{bt['hold'][key]:>14.2f}"
+                  f"{bt['recommended'][key]:>14.2f}")
     return 0
 
 

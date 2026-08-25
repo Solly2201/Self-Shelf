@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from .backtest import backtest_recommendations
 from .config import PricingConfig
 from .demand import (
     DemandModel,
@@ -26,6 +27,7 @@ class PipelineResult:
     model_report: Dict[str, Dict[str, float]]
     elasticities: Dict[str, object]
     config_summary: Dict[str, object]
+    backtest: Optional[Dict[str, object]] = None
 
 
 def prepare_data(
@@ -117,6 +119,7 @@ def run_pipeline(
     config: PricingConfig,
     num_items: int,
     collect_sweeps: bool = False,
+    collect_backtest: bool = False,
     progress: bool = False,
 ) -> PipelineResult:
     """Load data, train and evaluate the demand model, estimate
@@ -161,9 +164,17 @@ def run_pipeline(
         if progress and (pos + 1) % 10 == 0:
             print(f"Optimized {pos + 1}/{len(items)} items...")
 
+    recommendations_df = pd.DataFrame(recommendations)
+    backtest = (
+        backtest_recommendations(items, recommendations_df, config)
+        if collect_backtest and len(recommendations_df)
+        else None
+    )
+
     return PipelineResult(
-        recommendations=pd.DataFrame(recommendations),
+        recommendations=recommendations_df,
         sweeps=pd.DataFrame(sweep_rows) if collect_sweeps else None,
+        backtest=backtest,
         model_report=model_report,
         elasticities={
             dept: {
