@@ -915,3 +915,14 @@ input[type="range"] {
   .price-line { justify-content: flex-start; }
   .detail-head { flex-direction: column; }
 }
+
+/* V1.1 — elasticity confidence chips (label text carries the meaning;
+   color is reinforcement only) */
+.chip.conf-high { color: var(--positive); }
+.chip.conf-high::before { background: var(--positive); }
+.chip.conf-medium { color: var(--text-1); }
+.chip.conf-medium::before { background: var(--text-2); }
+.chip.conf-low { color: var(--warning); }
+.chip.conf-low::before { background: var(--warning); }
+.chip.conf-fallback { color: var(--text-2); border-style: dashed; }
+.chip.conf-fallback::before { background: var(--text-3); }

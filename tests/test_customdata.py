@@ -399,3 +399,148 @@ class TestEstimateDemandParams:
             k: vars(v) for k, v in b.items()
         }
         assert cat_a == cat_b
+
+    def test_estimated_categories_carry_confidence_intervals(self):
+        config = PricingConfig()
+        _, categories = estimate_demand_params(self.make_dataset(), config)
+        for cat in ("Bakery", "Dairy"):
+            conf = categories[cat]["confidence"]
+            assert conf is not None
+            assert conf["source"] == "estimated"
+            # Interval brackets the same point estimate the engine prices
+            # with — the two can never disagree.
+            assert conf["elasticity"] == pytest.approx(
+                categories[cat]["elasticity"], abs=1e-4
+            )
+            assert conf["lower_ci"] < conf["elasticity"] < conf["upper_ci"]
+            assert conf["standard_error"] > 0
+            assert conf["n_observations"] == categories[cat]["n_observations"]
+
+    def test_fallback_categories_have_no_fake_interval(self):
+        config = PricingConfig()
+        _, categories = estimate_demand_params(self.make_dataset(), config)
+        conf = categories["Beverages"]["confidence"]
+        assert conf["confidence"] == "fallback"
+        assert conf["standard_error"] is None
+        assert conf["lower_ci"] is None and conf["upper_ci"] is None
+
+    def test_price_variation_fallback_confidence_reason_matches(self):
+        config = PricingConfig()
+        rows = []
+        for date in pd.date_range("2026-05-01", periods=80, freq="D"):
+            rows.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "product_id": "A1",
+                "price": 4.5,
+                "units_sold": 12.0,
+            })
+        _, categories = estimate_demand_params(
+            self.make_dataset(pd.DataFrame(rows)), config
+        )
+        conf = categories["Bakery"]["confidence"]
+        assert conf["confidence"] == "fallback"
+        assert conf["reason"] == categories["Bakery"]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Replenishment data
+# ---------------------------------------------------------------------------
+
+REPLENISHMENT_MAPPING = {
+    "date": "date",
+    "product_id": "product_id",
+    "quantity": "quantity",
+}
+
+
+class TestValidateReplenishment:
+    def frame(self):
+        return pd.DataFrame({
+            "date": ["2026-07-01", "2026-07-03", "bad-date", "2026-07-04"],
+            "product_id": ["A1", "B2", "A1", "ZZ"],
+            "quantity": [50, 100, 25, 10],
+        })
+
+    def test_valid_rows_survive_and_bad_rows_get_reasons(self):
+        from selfshelf.customdata import validate_replenishment
+
+        result = validate_replenishment(
+            self.frame(), REPLENISHMENT_MAPPING, known_ids=["A1", "B2"]
+        )
+        assert result.ok
+        assert len(result.valid) == 2
+        reasons = set(result.rejected["reject_reason"])
+        assert any("date" in r for r in reasons)
+        assert any("products file" in r for r in reasons)
+
+    def test_negative_quantity_rejected(self):
+        from selfshelf.customdata import validate_replenishment
+
+        frame = pd.DataFrame({
+            "date": ["2026-07-01"], "product_id": ["A1"], "quantity": [-5],
+        })
+        result = validate_replenishment(frame, REPLENISHMENT_MAPPING)
+        assert len(result.valid) == 0
+        assert "negative" in result.rejected["reject_reason"].iloc[0]
+
+    def test_synonym_mapping_suggests_quantity(self):
+        got = suggest_mapping(
+            ["delivery_date", "sku", "units_received"], "replenishment"
+        )
+        assert got["date"]["column"] == "delivery_date"
+        assert got["product_id"]["column"] == "sku"
+        assert got["quantity"]["column"] == "units_received"
+
+
+class TestReplenishmentDataset:
+    def make_dataset(self, replenishment=None):
+        products = validate_products(products_frame(), PRODUCT_MAPPING).valid
+        txn = validate_transactions(transactions_frame(), TXN_MAPPING).valid
+        return CustomDataset(products, txn, replenishment=replenishment)
+
+    def replenishment_frame(self):
+        # History runs through 2026-06-29; reference "today" is 06-30.
+        return pd.DataFrame({
+            "date": pd.to_datetime(["2026-07-01", "2026-07-02", "2026-06-01"]),
+            "product_id": ["A1", "A1", "B2"],
+            "quantity": [200.0, 50.0, 30.0],
+        })
+
+    def test_reference_date_is_day_after_last_sale(self):
+        dataset = self.make_dataset()
+        last = dataset.transactions["date"].max().normalize()
+        assert dataset.reference_date() == last + pd.Timedelta(days=1)
+
+    def test_schedules_are_anchored_and_time_respecting(self):
+        dataset = self.make_dataset(self.replenishment_frame())
+        schedules = dataset.replenishment_schedules()
+        reference = dataset.reference_date()
+        expected_day = int(
+            (pd.Timestamp("2026-07-01") - reference).days
+        )
+        assert schedules["A1"].arrivals[expected_day] == 200.0
+        # B2's delivery predates "today" -> already in inventory, excluded.
+        assert "B2" not in schedules
+
+    def test_no_replenishment_data_yields_no_schedules(self):
+        dataset = self.make_dataset()
+        assert not dataset.has_replenishment
+        assert dataset.replenishment_schedules() == {}
+        assert dataset.quality_summary()["replenishment"] is None
+
+    def test_roundtrip_persistence(self, tmp_path):
+        dataset = self.make_dataset(self.replenishment_frame())
+        save_dataset(dataset, str(tmp_path))
+        loaded = load_dataset(str(tmp_path))
+        assert loaded.has_replenishment
+        assert len(loaded.replenishment) == 3
+        assert loaded.replenishment_schedules().keys() == (
+            dataset.replenishment_schedules().keys()
+        )
+
+    def test_saving_without_replenishment_removes_stale_file(self, tmp_path):
+        save_dataset(self.make_dataset(self.replenishment_frame()),
+                     str(tmp_path))
+        save_dataset(self.make_dataset(), str(tmp_path))
+        loaded = load_dataset(str(tmp_path))
+        assert not loaded.has_replenishment

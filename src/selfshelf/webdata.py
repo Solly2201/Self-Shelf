@@ -29,7 +29,9 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from .adaptivebacktest import backtest_closed_loop
 from .backtest import backtest_recommendations
+from .closedloop import forecast_deviation_environment, run_closed_loop
 from .config import PricingConfig
 from .customdata import CustomDataset, estimate_demand_params, load_dataset
 from .demand import DemandModel, estimate_elasticities
@@ -51,6 +53,12 @@ from .pathopt import (
     validate_daily_prices,
 )
 from .pipeline import _product_context, _recommendation_row, prepare_data
+from .replenishment import (
+    ReplenishmentSchedule,
+    optimize_path_with_replenishment,
+    replenishment_trajectory,
+)
+from .uncertainty import estimate_elasticities_with_confidence
 
 import pandas as pd
 
@@ -112,6 +120,12 @@ class BasePricingService:
         self._sweep_cache: Dict[str, List[Dict[str, float]]] = {}
         self._path_cache: Dict[str, PathResult] = {}
         self._path_backtest: Optional[Dict[str, object]] = None
+        # Per-department elasticity confidence records (JSON-safe dicts).
+        self._confidence: Dict[str, Dict[str, object]] = {}
+        # Per-product known future deliveries (custom source only).
+        self._replenishment: Dict[str, ReplenishmentSchedule] = {}
+        self._adaptive_cache: Dict[object, Dict[str, object]] = {}
+        self._adaptive_backtest: Optional[Dict[str, object]] = None
         self.generated_at: Optional[str] = None
 
     @property
@@ -234,6 +248,10 @@ class BasePricingService:
             if r.timing
             else None
         )
+        detail["elasticity_confidence"] = self._confidence.get(
+            record.department
+        )
+        detail["replenishment"] = self.replenishment_info(sku)
         return detail
 
     def sweep(self, sku: str) -> Optional[List[Dict[str, float]]]:
@@ -270,16 +288,34 @@ class BasePricingService:
 
     # -- multi-period paths --------------------------------------------------
 
+    def _replenishment_schedule(
+        self, sku: str
+    ) -> Optional[ReplenishmentSchedule]:
+        """Known future deliveries for one product; None when the data
+        source has no replenishment concept at all (synthetic simulator)."""
+        return self._replenishment.get(sku) if self._replenishment else None
+
     def _path_result(self, sku: str) -> Optional[PathResult]:
         record = self._products.get(sku)
         if record is None:
             return None
         if sku not in self._path_cache:
-            self._path_cache[sku] = optimize_path(
-                record.result.product,
-                self.config,
-                single_price=record.result.optimized_price,
-            )
+            schedule = self._replenishment_schedule(sku)
+            if schedule is not None and not schedule.is_empty:
+                # Same candidate class and tie-breaking; valuation sees the
+                # known deliveries (identical to optimize_path when empty).
+                self._path_cache[sku] = optimize_path_with_replenishment(
+                    record.result.product,
+                    self.config,
+                    schedule,
+                    single_price=record.result.optimized_price,
+                )
+            else:
+                self._path_cache[sku] = optimize_path(
+                    record.result.product,
+                    self.config,
+                    single_price=record.result.optimized_price,
+                )
         return self._path_cache[sku]
 
     def path(self, sku: str) -> Optional[Dict[str, object]]:
@@ -292,9 +328,16 @@ class BasePricingService:
         horizon = result.horizon_days
         cur = product.current_price
 
+        schedule = self._replenishment_schedule(sku)
+        if schedule is not None and not schedule.is_empty:
+            raw_rows = replenishment_trajectory(
+                product, self.config, result.schedule, schedule
+            )
+        else:
+            raw_rows = path_trajectory(product, self.config, result.schedule)
         trajectory = [
             {k: _f(v, 3) if k != "day" else int(v) for k, v in row.items()}
-            for row in path_trajectory(product, self.config, result.schedule)
+            for row in raw_rows
         ]
 
         strategies = {
@@ -332,6 +375,7 @@ class BasePricingService:
             ),
             "trajectory": trajectory,
             "reasons": list(result.reasons),
+            "replenishment": self.replenishment_info(sku),
             "constraints": {
                 "floor": _f(path_price_floor(product, self.config), 2),
                 "ceiling": _f(cur, 2),
@@ -380,6 +424,147 @@ class BasePricingService:
         """Synthetic-only; overridden by the synthetic service."""
         return None
 
+    # -- adaptive views ------------------------------------------------------
+
+    def elasticity_detail(self, sku: str) -> Optional[Dict[str, object]]:
+        """The product's elasticity with its statistical context: point
+        estimate, SE, confidence interval, observation counts, and how the
+        confidence label was earned (or why it fell back)."""
+        record = self._products.get(sku)
+        if record is None:
+            return None
+        confidence = self._confidence.get(record.department)
+        payload = {
+            "id": record.sku,
+            "department": record.department,
+            "elasticity": _f(record.result.product.elasticity, 4),
+            "confidence": confidence,
+        }
+        if record.provenance:
+            payload["provenance"] = record.provenance
+        return payload
+
+    def replenishment_info(self, sku: str) -> Optional[Dict[str, object]]:
+        """Known future deliveries for one product, or an explicit
+        statement of why none are modeled — never a silent zero."""
+        record = self._products.get(sku)
+        if record is None:
+            return None
+        if self.source == "synthetic":
+            return {
+                "id": record.sku,
+                "status": "not_modeled",
+                "message": (
+                    "Not modeled: the synthetic simulator does not "
+                    "generate delivery data."
+                ),
+            }
+        schedule = self._replenishment_schedule(sku)
+        if not self._has_replenishment_data():
+            return {
+                "id": record.sku,
+                "status": "no_data",
+                "message": (
+                    "No replenishment data supplied; inventory is modeled "
+                    "as non-replenished."
+                ),
+            }
+        if schedule is None or schedule.is_empty:
+            return {
+                "id": record.sku,
+                "status": "none_scheduled",
+                "message": (
+                    "Replenishment data is loaded, but no future "
+                    "deliveries are recorded for this product."
+                ),
+            }
+        return {
+            "id": record.sku,
+            "status": "known",
+            **schedule.as_dict(),
+        }
+
+    def _has_replenishment_data(self) -> bool:
+        return bool(self._replenishment)
+
+    def adaptive_simulation(
+        self,
+        sku: str,
+        demand_factor: float = 0.5,
+        noise_seed: Optional[int] = None,
+    ) -> Optional[Dict[str, object]]:
+        """Deterministic closed-loop what-if for one product.
+
+        Actual demand is simulated as the engine's own demand curve scaled
+        by ``demand_factor`` (optionally with seeded lognormal noise) —
+        a labeled synthetic simulation of the feedback loop, NOT observed
+        reality. Compares executing the day-0 plan open-loop against
+        re-optimizing daily under the same simulated sales.
+        """
+        record = self._products.get(sku)
+        if record is None:
+            return None
+        key = (sku, round(float(demand_factor), 4), noise_seed)
+        if key in self._adaptive_cache:
+            return self._adaptive_cache[key]
+
+        product = record.result.product
+        config = self.config
+        schedule = self._replenishment_schedule(sku)
+        horizon = self.config.objective.planning_horizon_days
+        noise = None
+        if noise_seed is not None:
+            rng = np.random.default_rng([config.seed, int(noise_seed)])
+            noise = rng.lognormal(
+                0.0, config.simulator.noise_sigma,
+                size=max(1, min(int(product.days_to_expiry), horizon)),
+            )
+        env = forecast_deviation_environment(
+            product, config, float(demand_factor), noise
+        )
+        closed = run_closed_loop(
+            product, config, env, replenishment=schedule,
+            reoptimize=True, max_days=horizon,
+        )
+        open_loop = run_closed_loop(
+            product, config, env, replenishment=schedule,
+            reoptimize=False, max_days=horizon,
+        )
+
+        def outcome(result):
+            return {k: _f(v, 2) for k, v in result.outcome.items()}
+
+        payload = {
+            "id": record.sku,
+            "name": record.name,
+            "label": (
+                "SYNTHETIC SIMULATION of future sales "
+                "(not observed reality)"
+            ),
+            "demand_factor": _f(demand_factor, 4),
+            "noise_seed": noise_seed,
+            "initial_plan": [_f(p, 2) for p in closed.initial_plan],
+            "days": [r.as_dict() for r in closed.records],
+            "acted_prices": [_f(p, 2) for p in closed.acted_prices],
+            "replans": closed.replans,
+            "final_state": closed.final_state.as_dict(),
+            "outcomes": {
+                "closed_loop": outcome(closed),
+                "open_loop": outcome(open_loop),
+            },
+            "value_of_feedback": _f(
+                closed.outcome["economic_value"]
+                - open_loop.outcome["economic_value"], 2
+            ),
+        }
+        self._adaptive_cache[key] = payload
+        return payload
+
+    def adaptive_backtest(self) -> Optional[Dict[str, object]]:
+        """Aggregate hold / open-loop / closed-loop comparison; only the
+        synthetic source has a ground-truth demand process to replay."""
+        return None
+
     # -- exports -------------------------------------------------------------
 
     def export_recommendations_csv(self) -> str:
@@ -407,14 +592,47 @@ class BasePricingService:
                 "Sell_Through_Current": cur["sell_through"],
                 "Sell_Through_Recommended": rec["sell_through"],
             }
+            conf = self._confidence.get(summary["department"]) or {}
+            row["Elasticity_Source"] = conf.get("source")
+            row["Elasticity_Confidence"] = conf.get("confidence")
+            row["Elasticity_SE"] = conf.get("standard_error")
+            row["Elasticity_CI_Low"] = conf.get("lower_ci")
+            row["Elasticity_CI_High"] = conf.get("upper_ci")
+            row["Elasticity_N_Obs"] = conf.get("n_observations")
+            rep = self.replenishment_info(summary["id"]) or {}
+            row["Replenishment_Status"] = rep.get("status")
+            nxt = rep.get("next_arrival") or {}
+            row["Replenishment_Next_Day"] = nxt.get("day")
+            row["Replenishment_Next_Units"] = nxt.get("units")
+            row["Replenishment_Total_Units"] = rep.get("total_units")
             if "provenance" in summary:
-                row["Elasticity_Source"] = summary["provenance"].get(
-                    "elasticity_source"
-                )
                 row["Baseline_Demand_Source"] = summary["provenance"].get(
                     "baseline_source"
                 )
             rows.append(row)
+        return self._to_csv(pd.DataFrame(rows))
+
+    def export_elasticity_csv(self) -> str:
+        """Per-department elasticity with its full statistical context."""
+        rows = []
+        for dept in sorted(self._confidence):
+            conf = self._confidence[dept] or {}
+            rows.append({
+                "Department": dept,
+                "Elasticity": conf.get("elasticity"),
+                "Source": conf.get("source"),
+                "Confidence": conf.get("confidence"),
+                "Standard_Error": conf.get("standard_error"),
+                "CI_Low": conf.get("lower_ci"),
+                "CI_High": conf.get("upper_ci"),
+                "Confidence_Level": conf.get("confidence_level"),
+                "N_Observations": conf.get("n_observations"),
+                "N_Distinct_Prices": conf.get("n_distinct_prices"),
+                "Price_Ratio_Min": conf.get("price_ratio_min"),
+                "Price_Ratio_Max": conf.get("price_ratio_max"),
+                "Estimation_Method": conf.get("estimation_method"),
+                "Reason": conf.get("reason"),
+            })
         return self._to_csv(pd.DataFrame(rows))
 
     def export_paths_csv(self) -> str:
@@ -433,6 +651,8 @@ class BasePricingService:
                     "Expected_Sales_Units":
                         day_row["expected_sales_units"],
                     "Start_Inventory": day_row["start_inventory"],
+                    "Replenishment_Received":
+                        day_row.get("replenishment_received", 0.0),
                     "End_Inventory": day_row["end_inventory"],
                     "Expected_Revenue": day_row["expected_revenue"],
                     "Projected_Waste_Units":
@@ -640,6 +860,14 @@ class PricingService(BasePricingService):
         model = DemandModel(seed=config.seed).fit(split.train)
         self._model_report = evaluate_model(model, split)
         estimates = estimate_elasticities(split.train, config)
+        # Same regression with OLS inference on top; point estimates are
+        # identical to ``estimates`` by construction.
+        self._confidence = {
+            dept: est.as_dict()
+            for dept, est in estimate_elasticities_with_confidence(
+                split.train, config
+            ).items()
+        }
 
         items = split.test.head(self.num_items)
         baselines = model.predict(items)
@@ -703,6 +931,25 @@ class PricingService(BasePricingService):
             )
         return self._path_backtest
 
+    def adaptive_backtest(self) -> Optional[Dict[str, object]]:
+        """Hold vs open-loop vs closed-loop under the synthetic simulator
+        with common random numbers. Episodes are capped at the planning
+        horizon so long-dated stock does not dominate runtime; the cap
+        applies to every strategy alike. Cached after first computation."""
+        if not self.ready or self._items is None:
+            return None
+        if self._adaptive_backtest is None:
+            contexts = [
+                self._products[sku].result.product for sku in self._order
+            ]
+            cap = self.config.objective.planning_horizon_days
+            result = backtest_closed_loop(
+                self._items, contexts, self.config, max_days=cap
+            )
+            result["episode_cap_days"] = cap
+            self._adaptive_backtest = result
+        return self._adaptive_backtest
+
     def meta(self) -> Dict[str, object]:
         return {
             "generated_at": self.generated_at,
@@ -716,6 +963,11 @@ class PricingService(BasePricingService):
                 for split, metrics in self._model_report.items()
             },
             "elasticities": self._elasticities,
+            "elasticity_confidence": self._confidence,
+            "replenishment": {
+                "has_data": False,
+                "message": "Not modeled in the synthetic simulator.",
+            },
         }
 
 
@@ -762,6 +1014,10 @@ class CustomPricingService(BasePricingService):
 
         params, categories = estimate_demand_params(dataset, config)
         self._categories = categories
+        self._confidence = {
+            cat: info.get("confidence") for cat, info in categories.items()
+        }
+        self._replenishment = dataset.replenishment_schedules()
         self._quality = dataset.quality_summary()
         self._imported_at = dataset.meta.get("imported_at")
 
@@ -810,7 +1066,17 @@ class CustomPricingService(BasePricingService):
         )
         return self
 
+    def _has_replenishment_data(self) -> bool:
+        # Distinct from having *schedules*: the file may exist while every
+        # delivery in it has already arrived (nothing future remains).
+        return bool(self._dataset is not None
+                    and self._dataset.has_replenishment)
+
     def meta(self) -> Dict[str, object]:
+        reference = (
+            self._dataset.reference_date() if self._dataset is not None
+            else None
+        )
         return {
             "generated_at": self.generated_at,
             "seed": self.config.seed,
@@ -833,5 +1099,18 @@ class CustomPricingService(BasePricingService):
                     "price_variation": _f(info["price_variation"], 4),
                 }
                 for cat, info in self._categories.items()
+            },
+            "elasticity_confidence": self._confidence,
+            "replenishment": {
+                "has_data": self._has_replenishment_data(),
+                "products_with_future_deliveries": len(self._replenishment),
+                "reference_date": (
+                    str(reference.date()) if reference is not None else None
+                ),
+                "message": (
+                    None if self._has_replenishment_data() else
+                    "No replenishment data supplied; inventory is modeled "
+                    "as non-replenished."
+                ),
             },
         }

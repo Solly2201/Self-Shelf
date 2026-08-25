@@ -36,6 +36,10 @@ import pandas as pd
 from .config import PricingConfig
 from .demand import estimate_elasticities
 from .economics import price_effect
+from .uncertainty import (
+    estimate_elasticities_with_confidence,
+    fallback_confidence,
+)
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -49,6 +53,9 @@ PRODUCT_OPTIONAL = ["category", "retail_price", "promotion"]
 
 TRANSACTION_REQUIRED = ["date", "product_id", "price", "units_sold"]
 TRANSACTION_OPTIONAL = ["promotion"]
+
+REPLENISHMENT_REQUIRED = ["date", "product_id", "quantity"]
+REPLENISHMENT_OPTIONAL: List[str] = []
 
 FIELD_SYNONYMS: Dict[str, List[str]] = {
     "product_id": [
@@ -101,6 +108,11 @@ FIELD_SYNONYMS: Dict[str, List[str]] = {
         "units_sold", "units", "quantity", "qty", "sales", "volume",
         "qty_sold", "sales_units", "demand", "sold",
     ],
+    "quantity": [
+        "quantity", "qty", "units", "quantity_received", "units_received",
+        "received", "delivery_quantity", "delivered_units", "order_qty",
+        "shipment_units", "amount",
+    ],
 }
 
 # Fields whose synonyms overlap (e.g. "price"); resolved in listed order so
@@ -118,6 +130,8 @@ def fields_for(kind: str) -> Tuple[List[str], List[str]]:
         return PRODUCT_REQUIRED, PRODUCT_OPTIONAL
     if kind == "transactions":
         return TRANSACTION_REQUIRED, TRANSACTION_OPTIONAL
+    if kind == "replenishment":
+        return REPLENISHMENT_REQUIRED, REPLENISHMENT_OPTIONAL
     raise ValueError(f"unknown data kind: {kind}")
 
 
@@ -416,6 +430,62 @@ def validate_transactions(
     return ValidationResult("transactions", valid, rejected, issues=issues)
 
 
+def validate_replenishment(
+    raw: pd.DataFrame,
+    mapping: Dict[str, str],
+    known_ids: Optional[Sequence[str]] = None,
+) -> ValidationResult:
+    """Validate an optional replenishment file: one row per delivery with
+    date, product_id and quantity (units received)."""
+    mapped, errors = _apply_mapping(raw, mapping, "replenishment")
+    if errors:
+        return ValidationResult(
+            "replenishment", pd.DataFrame(), pd.DataFrame(), errors=errors
+        )
+
+    df = mapped.copy()
+    reasons = pd.Series(pd.NA, index=df.index, dtype=object)
+
+    df["product_id"] = df["product_id"].astype(str).str.strip()
+    reasons = _reject(
+        reasons,
+        df["product_id"].isin(["", "nan", "None", "<NA>"]),
+        "missing product_id",
+    )
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", format="mixed")
+    reasons = _reject(
+        reasons, df["date"].isna(), "date is missing or unparseable"
+    )
+
+    df["quantity"] = _numeric(df["quantity"])
+    reasons = _reject(
+        reasons, df["quantity"].isna() | (df["quantity"] < 0),
+        "quantity is missing, non-numeric, or negative",
+    )
+
+    if known_ids is not None:
+        known = set(map(str, known_ids))
+        reasons = _reject(
+            reasons, ~df["product_id"].isin(known),
+            "product_id does not appear in the products file",
+        )
+
+    issues: List[Dict[str, object]] = []
+    _collect_issues(reasons, issues)
+
+    valid = df[reasons.isna()].copy()
+    rejected = raw.loc[reasons.notna()].copy()
+    if len(rejected):
+        rejected["reject_reason"] = reasons.dropna()
+
+    valid = valid[
+        ["date", "product_id", "quantity"]
+    ].sort_values("date").reset_index(drop=True)
+
+    return ValidationResult("replenishment", valid, rejected, issues=issues)
+
+
 # ---------------------------------------------------------------------------
 # Dataset + persistence
 # ---------------------------------------------------------------------------
@@ -425,6 +495,36 @@ class CustomDataset:
     products: pd.DataFrame
     transactions: pd.DataFrame
     meta: Dict[str, object] = field(default_factory=dict)
+    # Optional deliveries file. None means "no replenishment data supplied"
+    # — the model then treats inventory as non-replenished, and says so.
+    replenishment: Optional[pd.DataFrame] = None
+
+    @property
+    def has_replenishment(self) -> bool:
+        return self.replenishment is not None and len(self.replenishment) > 0
+
+    def reference_date(self) -> Optional[pd.Timestamp]:
+        """"Today" in the dataset's timeline: the day after the last
+        recorded sales day. The products file is a snapshot of current
+        state, so the history is assumed to run through yesterday."""
+        if not len(self.transactions):
+            return None
+        return (
+            self.transactions["date"].max().normalize()
+            + pd.Timedelta(days=1)
+        )
+
+    def replenishment_schedules(self):
+        """Per-product future-delivery schedules, anchored at
+        ``reference_date``. Empty dict when no data was supplied."""
+        from .replenishment import schedules_from_events
+
+        if not self.has_replenishment:
+            return {}
+        reference = self.reference_date()
+        if reference is None:
+            return {}
+        return schedules_from_events(self.replenishment, reference)
 
     def quality_summary(self) -> Dict[str, object]:
         txn = self.transactions
@@ -451,6 +551,18 @@ class CustomDataset:
             "median_observations_per_product": (
                 float(by_product.median()) if len(by_product) else 0.0
             ),
+            "replenishment": (
+                {
+                    "events": int(len(self.replenishment)),
+                    "products_covered": int(
+                        self.replenishment["product_id"].nunique()
+                    ),
+                    "total_units": float(
+                        self.replenishment["quantity"].sum()
+                    ),
+                }
+                if self.has_replenishment else None
+            ),
         }
 
 
@@ -461,6 +573,13 @@ def save_dataset(dataset: CustomDataset, directory: str) -> None:
     txn = dataset.transactions.copy()
     txn["date"] = txn["date"].dt.strftime("%Y-%m-%d")
     txn.to_csv(path / "transactions.csv", index=False)
+    replenishment_file = path / "replenishment.csv"
+    if dataset.has_replenishment:
+        rep = dataset.replenishment.copy()
+        rep["date"] = rep["date"].dt.strftime("%Y-%m-%d")
+        rep.to_csv(replenishment_file, index=False)
+    elif replenishment_file.exists():
+        replenishment_file.unlink()
     with open(path / "meta.json", "w", encoding="utf-8") as fh:
         json.dump(dataset.meta, fh, indent=2)
 
@@ -476,12 +595,19 @@ def load_dataset(directory: str) -> Optional[CustomDataset]:
         transactions_file, dtype={"product_id": str},
         parse_dates=["date"],
     )
+    replenishment_file = path / "replenishment.csv"
+    replenishment = None
+    if replenishment_file.exists():
+        replenishment = pd.read_csv(
+            replenishment_file, dtype={"product_id": str},
+            parse_dates=["date"],
+        )
     meta_file = path / "meta.json"
     meta = {}
     if meta_file.exists():
         with open(meta_file, encoding="utf-8") as fh:
             meta = json.load(fh)
-    return CustomDataset(products, transactions, meta)
+    return CustomDataset(products, transactions, meta, replenishment)
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +687,11 @@ def estimate_demand_params(
         })
         frame = frame[np.isfinite(frame["PRICE_RATIO"])]
         estimates = estimate_elasticities(frame, config, min_observations)
+        # Same regression with OLS inference on top; the point estimates are
+        # identical to ``estimates`` by construction (see uncertainty.py).
+        confidence_estimates = estimate_elasticities_with_confidence(
+            frame, config, min_observations
+        )
 
         frame_sorted = frame.sort_values("date")
         cutoff = max(1, int(len(frame_sorted) * 0.8))
@@ -570,6 +701,8 @@ def estimate_demand_params(
 
         for cat, group in frame.groupby("DEPARTMENT"):
             est = estimates.get(cat)
+            conf = confidence_estimates.get(cat)
+            n_levels = int(conf.n_distinct_prices) if conf else 0
             variation = float(group["PRICE_RATIO"].std() or 0.0)
             n_obs = int(est.n_observations) if est else 0
             if est is None or est.source == "default":
@@ -584,17 +717,26 @@ def estimate_demand_params(
                     "elasticity": fallback, "source": "fallback",
                     "n_observations": n_obs, "price_variation": variation,
                     "reason": reason, "stability": None,
+                    "confidence": fallback_confidence(
+                        fallback, reason, n_observations=n_obs,
+                        n_distinct_prices=n_levels,
+                    ).as_dict(),
                 }
                 continue
             if variation < min_price_variation:
+                reason = (
+                    "insufficient price variation in the history "
+                    f"({variation:.3f} < {min_price_variation})"
+                )
                 categories[cat] = {
                     "elasticity": fallback, "source": "fallback",
                     "n_observations": n_obs, "price_variation": variation,
-                    "reason": (
-                        "insufficient price variation in the history "
-                        f"({variation:.3f} < {min_price_variation})"
-                    ),
+                    "reason": reason,
                     "stability": None,
+                    "confidence": fallback_confidence(
+                        fallback, reason, n_observations=n_obs,
+                        n_distinct_prices=n_levels,
+                    ).as_dict(),
                 }
                 continue
             early_est = early.get(cat)
@@ -607,15 +749,21 @@ def estimate_demand_params(
                 "n_observations": n_obs, "price_variation": variation,
                 "reason": "estimated from observed price variation",
                 "stability": stability,
+                "confidence": (
+                    conf.as_dict()
+                    if conf is not None and conf.source == "estimated"
+                    else None
+                ),
             }
     # Categories that exist in products but have no transactions at all.
     for cat in products["category"].unique():
         if cat not in categories:
+            reason = "no transaction history for this category"
             categories[cat] = {
                 "elasticity": fallback, "source": "fallback",
                 "n_observations": 0, "price_variation": 0.0,
-                "reason": "no transaction history for this category",
-                "stability": None,
+                "reason": reason, "stability": None,
+                "confidence": fallback_confidence(fallback, reason).as_dict(),
             }
 
     # -- per-product baseline demand ----------------------------------------
