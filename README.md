@@ -220,7 +220,7 @@ Output goes to `output/final_optimized_prices.csv` as a full economic audit of e
 | `Break_Even_Unit_Uplift`, `Predicted_Unit_Uplift` | gross-profit hurdle vs forecast |
 | `Economic_Reason` | structured explanation |
 
-`--backtest` replays every recommendation day by day under the synthetic simulator's ground truth (identical noise for both strategies) and prints hold-vs-recommended revenue, gross profit, waste, sell-through and cash recovered. The output is labeled a **synthetic simulation** — it measures optimization quality inside the simulated economy, not real-world performance.
+`--backtest` replays every recommendation day by day under the synthetic simulator's ground truth (identical noise for both strategies) and prints hold-vs-recommended revenue, gross profit, holding cost, economic value, units sold, waste, terminal inventory, sell-through and cash recovered. The accounting reconciles by construction (`units sold + terminal inventory = starting inventory`). The output is labeled a **synthetic simulation** — it measures optimization quality inside the simulated economy, not real-world performance.
 
 `--sweep` additionally writes `final_optimized_prices_sweep.csv`: demand, revenue, profit, waste, and economic score across the feasible price range for each product — the data behind price–demand and profit curves.
 
@@ -232,7 +232,7 @@ Output goes to `output/final_optimized_prices.csv` as a full economic audit of e
 python -m pytest
 ```
 
-The suite (≈130 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
+The suite (≈150 tests) covers the economic primitives and, more importantly, **markdown-economics behavior**:
 
 - healthy inventory is not marked down
 - overstocked near-expiry stock receives meaningful downward pressure that measurably reduces expected waste
@@ -246,6 +246,8 @@ The suite (≈130 tests) covers the economic primitives and, more importantly, *
 - price-path evaluation reproduces the one-shot objective exactly, and acting now beats waiting for overstocked short-dated stock
 - prices always respect bounds, waste/sales are never negative, zero-demand/zero-inventory/cost-above-price edge cases are safe
 - the whole pipeline and the backtest are reproducible end-to-end given a seed
+
+An audit suite additionally locks down: dimensional reconciliation of every objective component ($ = $/unit × units; the score equals the sum of its parts; units sold + terminal inventory = starting inventory), monetary-scale invariance, sensitivity monotonicity (waste cost, holding cost, inventory, remaining days, elasticity), PSO agreement with a 1001-point explicit grid on random products, whole-cent rounding invariants, the break-even/gross-profit equivalence, four distinct economic regimes (hold / shallow / moderate / deep markdown), and backtest counterfactual fairness (recommending the current price reproduces the hold strategy exactly).
 
 ---
 
